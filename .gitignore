@@ -1,0 +1,5 @@
+/target/
+*.log
+.env
+.codeatlas/
+*:Zone.Identifier

@@ -1,0 +1,12 @@
+[package]
+name = "codeatlas-diagram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codeatlas-core = { path = "../codeatlas-core" }
+
+[lints]
+workspace = true

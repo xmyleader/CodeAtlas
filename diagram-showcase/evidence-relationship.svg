@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1184" height="680" viewBox="0 0 1184 680" role="img" aria-labelledby="diagram-title-0 diagram-description-0" data-kind="relationship">
+  <title id="diagram-title-0">Grounded answer relationships</title>
+  <desc id="diagram-description-0">CodeAtlas Relationship diagram. Title: Grounded answer relationships</desc>
+  <defs>
+    <marker id="arrowhead-0" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#7dd3fc"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1184" height="680" fill="#080d18"/>
+  <text x="152" y="38" fill="#f8fafc" font-family="ui-monospace, monospace" font-size="18" font-weight="700">Grounded answer relationships</text>
+  <text x="152" y="64" fill="#7dd3fc" font-family="ui-monospace, monospace" font-size="12" font-weight="700">RELATIONSHIP</text>
+  <path d="M 152 76 L 1032 76" fill="none" stroke="#263248" stroke-width="1"/>
+  <g id="edge-0" class="edge" data-claim-ids="09ee9f111e9c8474e90c6bd7ad8f1c64" data-evidence-ids="af13eee7abc6059b9c80973c75404786">
+    <title>AgentAnswer -&gt; CallPath
+steps: contains</title>
+    <path d="M 700 323 C 758 323 758 149 816 149" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="718" y="213" width="80" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="758" y="230" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="758" y="230">contains</tspan>
+    </text>
+  </g>
+  <g id="edge-1" class="edge" data-claim-ids="09ee9f111e9c8474e90c6bd7ad8f1c64" data-evidence-ids="af13eee7abc6059b9c80973c75404786">
+    <title>AgentAnswer -&gt; Fact Claim: contains</title>
+    <path d="M 700 323 C 758 323 758 235 816 235" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="718" y="256" width="80" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="758" y="273" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="758" y="273">contains</tspan>
+    </text>
+  </g>
+  <g id="edge-2" class="edge" data-claim-ids="09ee9f111e9c8474e90c6bd7ad8f1c64" data-evidence-ids="af13eee7abc6059b9c80973c75404786">
+    <title>AgentAnswer -&gt; Diagram
+nodes + edges: DiagramDecision</title>
+    <path d="M 700 323 C 758 323 758 321 816 321" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="690" y="299" width="136" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="758" y="316" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="758" y="316">DiagramDecision</tspan>
+    </text>
+  </g>
+  <g id="edge-3" class="edge" data-claim-ids="09ee9f111e9c8474e90c6bd7ad8f1c64" data-evidence-ids="af13eee7abc6059b9c80973c75404786">
+    <title>AgentAnswer -&gt; Evidence
+path + span + excerpt: carries</title>
+    <path d="M 700 323 C 758 323 758 408 816 408" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="722" y="342" width="72" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="758" y="359" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="758" y="359">carries</tspan>
+    </text>
+  </g>
+  <g id="edge-4" class="edge" data-claim-ids="a41d7a1a4e266bfd310e6b4c888b0c9e" data-evidence-ids="888a24a5858180018ca9cf4bd8199471 49330425afbdebba275e433236b38678 c5e494249ad16e802f63184b227aeabc 3338dd6de6236d83f230913b061119c4">
+    <title>AgentAnswer -&gt; validate_evidence
+validation gate: validate_evidence()</title>
+    <path d="M 700 323 C 758 323 758 496 816 496" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="674" y="386" width="168" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="758" y="403" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="758" y="403">validate_evidence()</tspan>
+    </text>
+  </g>
+  <g id="edge-5" class="edge" data-claim-ids="bb0684d9e9799291576c34c982bc7167" data-evidence-ids="0e3bd2fa064ac9da545c9caecb4e0145 888a24a5858180018ca9cf4bd8199471">
+    <title>CallPath
+steps -&gt; Evidence
+path + span + excerpt: step evidence_ids</title>
+    <path d="M 924 180 C 924 278 924 278 924 376" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="848" y="255" width="152" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="924" y="272" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="924" y="272">step evidence_ids</tspan>
+    </text>
+  </g>
+  <g id="edge-6" class="edge" data-claim-ids="f5d13d6b30a2ae6cc99aa47f7097e581" data-evidence-ids="0393900e2af37fbf8d11c87d7e90aeac 888a24a5858180018ca9cf4bd8199471">
+    <title>Fact Claim -&gt; Evidence
+path + span + excerpt: cites evidence_ids</title>
+    <path d="M 924 266 C 924 321 924 321 924 376" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="844" y="298" width="160" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="924" y="315" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="924" y="315">cites evidence_ids</tspan>
+    </text>
+  </g>
+  <g id="edge-7" class="edge" data-claim-ids="d273796ba03d2eff3e24191c7eea451b" data-evidence-ids="3338dd6de6236d83f230913b061119c4">
+    <title>Diagram
+nodes + edges -&gt; Fact Claim: binds Fact claim_ids</title>
+    <path d="M 924 290 C 924 278 924 278 924 266" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="836" y="255" width="176" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="924" y="272" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="924" y="272">binds Fact claim_ids</tspan>
+    </text>
+  </g>
+  <g id="edge-8" class="edge" data-claim-ids="d273796ba03d2eff3e24191c7eea451b" data-evidence-ids="3338dd6de6236d83f230913b061119c4">
+    <title>Diagram
+nodes + edges -&gt; Evidence
+path + span + excerpt: binds linked evidence_ids</title>
+    <path d="M 924 352 C 924 364 924 364 924 376" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="868" y="333" width="112" height="42" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="924" y="350" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="924" y="350">binds linked</tspan>
+      <tspan x="924" y="366">evidence_ids</tspan>
+    </text>
+  </g>
+  <g id="edge-9" class="edge" data-claim-ids="a41d7a1a4e266bfd310e6b4c888b0c9e" data-evidence-ids="888a24a5858180018ca9cf4bd8199471 49330425afbdebba275e433236b38678 c5e494249ad16e802f63184b227aeabc 3338dd6de6236d83f230913b061119c4">
+    <title>validate_evidence
+validation gate -&gt; CallPath
+steps: checks known Evidence</title>
+    <path d="M 924 464 C 924 322 924 322 924 180" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="832" y="299" width="184" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="924" y="316" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="924" y="316">checks known Evidence</tspan>
+    </text>
+  </g>
+  <g id="edge-10" class="edge" data-claim-ids="a41d7a1a4e266bfd310e6b4c888b0c9e" data-evidence-ids="888a24a5858180018ca9cf4bd8199471 49330425afbdebba275e433236b38678 c5e494249ad16e802f63184b227aeabc 3338dd6de6236d83f230913b061119c4">
+    <title>validate_evidence
+validation gate -&gt; Fact Claim: checks Fact support</title>
+    <path d="M 924 464 C 924 365 924 365 924 266" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="840" y="342" width="168" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="924" y="359" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="924" y="359">checks Fact support</tspan>
+    </text>
+  </g>
+  <g id="edge-11" class="edge" data-claim-ids="a41d7a1a4e266bfd310e6b4c888b0c9e" data-evidence-ids="888a24a5858180018ca9cf4bd8199471 49330425afbdebba275e433236b38678 c5e494249ad16e802f63184b227aeabc 3338dd6de6236d83f230913b061119c4">
+    <title>validate_evidence
+validation gate -&gt; Diagram
+nodes + edges: checks all bindings</title>
+    <path d="M 924 464 C 924 408 924 408 924 352" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="840" y="385" width="168" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="924" y="402" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="924" y="402">checks all bindings</tspan>
+    </text>
+  </g>
+  <g id="node-0" class="node focus-node" data-claim-ids="09ee9f111e9c8474e90c6bd7ad8f1c64" data-evidence-ids="af13eee7abc6059b9c80973c75404786">
+    <title>AgentAnswer</title>
+    <rect x="484" y="292" width="216" height="62" rx="12" fill="#16243a" stroke="#fbbf24" stroke-width="2"/>
+    <text x="592" y="328" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="592" y="328">AgentAnswer</tspan>
+    </text>
+  </g>
+  <g id="node-1" class="node" data-claim-ids="bb0684d9e9799291576c34c982bc7167" data-evidence-ids="0e3bd2fa064ac9da545c9caecb4e0145 888a24a5858180018ca9cf4bd8199471">
+    <title>CallPath
+steps</title>
+    <rect x="816" y="118" width="216" height="62" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="924" y="154" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="924" y="154">CallPath steps</tspan>
+    </text>
+  </g>
+  <g id="node-2" class="node" data-claim-ids="f5d13d6b30a2ae6cc99aa47f7097e581" data-evidence-ids="0393900e2af37fbf8d11c87d7e90aeac 888a24a5858180018ca9cf4bd8199471">
+    <title>Fact Claim</title>
+    <rect x="816" y="204" width="216" height="62" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="924" y="240" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="924" y="240">Fact Claim</tspan>
+    </text>
+  </g>
+  <g id="node-3" class="node" data-claim-ids="fa1c8c67695fa69996b0555e040ee2e0" data-evidence-ids="9ae73f611d31e625d266b4f95fd22c1f">
+    <title>Diagram
+nodes + edges</title>
+    <rect x="816" y="290" width="216" height="62" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="924" y="326" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="924" y="326">Diagram nodes + edges</tspan>
+    </text>
+  </g>
+  <g id="node-4" class="node" data-claim-ids="e2cf6b2944928cd6fcd6a315346fc04b" data-evidence-ids="65413c6698e4b4b47db31db17323b943">
+    <title>Evidence
+path + span + excerpt</title>
+    <rect x="816" y="376" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="924" y="404" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="924" y="404">Evidence path + span +</tspan>
+      <tspan x="924" y="422">excerpt</tspan>
+    </text>
+  </g>
+  <g id="node-5" class="node" data-claim-ids="a41d7a1a4e266bfd310e6b4c888b0c9e" data-evidence-ids="888a24a5858180018ca9cf4bd8199471 49330425afbdebba275e433236b38678 c5e494249ad16e802f63184b227aeabc 3338dd6de6236d83f230913b061119c4">
+    <title>validate_evidence
+validation gate</title>
+    <rect x="816" y="464" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="924" y="492" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="924" y="492">validate_evidence</tspan>
+      <tspan x="924" y="510">validation gate</tspan>
+    </text>
+  </g>
+</svg>

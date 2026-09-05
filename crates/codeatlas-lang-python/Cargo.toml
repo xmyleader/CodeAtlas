@@ -1,0 +1,17 @@
+[package]
+name = "codeatlas-lang-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codeatlas-core = { path = "../codeatlas-core" }
+tree-sitter = "0.25.10"
+tree-sitter-python = "0.25.0"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "codeatlas-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codeatlas-core = { path = "../codeatlas-core" }
+eframe = { version = "=0.31.1", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+rfd = { version = "=0.15.4", default-features = false, features = [
+    "async-std",
+    "xdg-portal",
+] }
+
+[lints]
+workspace = true

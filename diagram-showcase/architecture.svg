@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2392" height="352" viewBox="0 0 2392 352" role="img" aria-labelledby="diagram-title-0 diagram-description-0" data-kind="architecture">
+  <title id="diagram-title-0">CodeAtlas crate architecture</title>
+  <desc id="diagram-description-0">CodeAtlas Architecture diagram. Title: CodeAtlas crate architecture</desc>
+  <defs>
+    <marker id="arrowhead-0" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#7dd3fc"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="2392" height="352" fill="#080d18"/>
+  <text x="152" y="38" fill="#f8fafc" font-family="ui-monospace, monospace" font-size="18" font-weight="700">CodeAtlas crate architecture</text>
+  <text x="152" y="64" fill="#7dd3fc" font-family="ui-monospace, monospace" font-size="12" font-weight="700">ARCHITECTURE</text>
+  <path d="M 152 76 L 2240 76" fill="none" stroke="#263248" stroke-width="1"/>
+  <g id="edge-0" class="edge" data-claim-ids="5e450f898661a72692459d544bdfbbc0" data-evidence-ids="5df8839734b08649f847ef92a9557486">
+    <title>codeatlas-agent
+tool loop + evidence gate -&gt; codeatlas-app
+composition + dispatch: runtime run by app</title>
+    <path d="M 1616 159 C 1664 159 1664 159 1712 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="1584" y="136" width="160" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="1664" y="153" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="1664" y="153">runtime run by app</tspan>
+    </text>
+  </g>
+  <g id="edge-1" class="edge" data-claim-ids="5ed8efabe4efdf21c0670a900b3b876d" data-evidence-ids="9e64e9be947dae0a9c3cc5b0406487b2 818dfdc2dacf4d289686b2a2f983d989">
+    <title>codeatlas-app
+composition + dispatch -&gt; codeatlas-tui
+commands/events UI: channel application port</title>
+    <path d="M 1928 159 C 1976 159 1976 159 2024 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="1892" y="128" width="168" height="42" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="1976" y="145" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="1976" y="145">channel application</tspan>
+      <tspan x="1976" y="161">port</tspan>
+    </text>
+  </g>
+  <g id="edge-2" class="edge" data-claim-ids="01e3d086934fe500edfaa19a29694ab8" data-evidence-ids="4f7195a6cf63518bd36ea0d0303ea22b dd058148c5bef394b457aba7e0c4988c c655bb3e3937453f28da87cd67bd493b">
+    <title>codeatlas-core
+contracts + neutral IR -&gt; codeatlas-agent
+tool loop + evidence gate: answer + event + tool contracts</title>
+    <path d="M 368 159 C 884 159 884 159 1400 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="792" y="128" width="184" height="42" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="884" y="145" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="884" y="145">answer + event + tool</tspan>
+      <tspan x="884" y="161">contracts</tspan>
+    </text>
+  </g>
+  <g id="edge-3" class="edge" data-claim-ids="4ba24f2dd4b4a4b773cd63f891cae90e" data-evidence-ids="ecf9626b5d0c4714bc7b5d54f146d892 9d6455bf7f0b33b82524088505d0ace0">
+    <title>codeatlas-core
+contracts + neutral IR -&gt; codeatlas-indexer
+scan + parse + assemble: ParseInput + RepositoryModel</title>
+    <path d="M 368 159 C 572 159 572 159 776 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="504" y="128" width="136" height="42" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="572" y="145" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="572" y="145">ParseInput +</tspan>
+      <tspan x="572" y="161">RepositoryModel</tspan>
+    </text>
+  </g>
+  <g id="edge-4" class="edge" data-claim-ids="a39edbd6a500be050e10ae4208c13486" data-evidence-ids="f5280803a4e7aebefb3d6c1762155fbc 5c3e464a7bd223879b240eeaa2aa5d46">
+    <title>codeatlas-core
+contracts + neutral IR -&gt; language parsers
+Rust + Python adapters: ParserAdapter contract</title>
+    <path d="M 368 159 C 416 159 416 159 464 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="320" y="136" width="192" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="416" y="153" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="416" y="153">ParserAdapter contract</tspan>
+    </text>
+  </g>
+  <g id="edge-5" class="edge" data-claim-ids="f4a895c329c8a2ebba787fa6fdbb1b52" data-evidence-ids="7650201de43a73a869d62a5ecb399569 20482840d05e30aefba88d8e85fc3a78">
+    <title>codeatlas-core
+contracts + neutral IR -&gt; codeatlas-query
+read-only index + tools: model + tool contracts</title>
+    <path d="M 368 159 C 728 159 728 159 1088 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="632" y="136" width="192" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="728" y="153" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="728" y="153">model + tool contracts</tspan>
+    </text>
+  </g>
+  <g id="edge-6" class="edge" data-claim-ids="8f11b75f0cc716aea499b5390efa2ceb" data-evidence-ids="61f74a67958ada346fdffb3706dcb514">
+    <title>codeatlas-core
+contracts + neutral IR -&gt; codeatlas-tui
+commands/events UI: AppCommand + AppEvent</title>
+    <path d="M 368 159 C 1196 159 1196 159 2024 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="1104" y="136" width="184" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="1196" y="153" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="1196" y="153">AppCommand + AppEvent</tspan>
+    </text>
+  </g>
+  <g id="edge-7" class="edge" data-claim-ids="b0ec22e49786fe2d811cd8c2dc940fd8" data-evidence-ids="bf038c185c4b81301f8f4c7190e036f0 baa909be39a22b9a6c661067fcd664df">
+    <title>codeatlas-indexer
+scan + parse + assemble -&gt; codeatlas-app
+composition + dispatch: composed indexing service</title>
+    <path d="M 992 159 C 1352 159 1352 159 1712 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="1276" y="128" width="152" height="42" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="1352" y="145" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="1352" y="145">composed indexing</tspan>
+      <tspan x="1352" y="161">service</tspan>
+    </text>
+  </g>
+  <g id="edge-8" class="edge" data-claim-ids="3780c7c6c695e8609a8dba4f63adab2a" data-evidence-ids="3d6b9339afb4e4a57d08175d841ae114">
+    <title>codeatlas-indexer
+scan + parse + assemble -&gt; codeatlas-query
+read-only index + tools: RepositoryModel</title>
+    <path d="M 992 159 C 1040 159 1040 159 1088 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="972" y="136" width="136" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="1040" y="153" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="1040" y="153">RepositoryModel</tspan>
+    </text>
+  </g>
+  <g id="edge-9" class="edge" data-claim-ids="e4942b2192d48226b9004cdfed2bbc2a" data-evidence-ids="75f935013dfa7625f9f5efd2f6609e0d">
+    <title>language parsers
+Rust + Python adapters -&gt; codeatlas-indexer
+scan + parse + assemble: registered adapters</title>
+    <path d="M 680 159 C 728 159 728 159 776 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="644" y="136" width="168" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="728" y="153" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="728" y="153">registered adapters</tspan>
+    </text>
+  </g>
+  <g id="edge-10" class="edge" data-claim-ids="5e450f898661a72692459d544bdfbbc0" data-evidence-ids="5df8839734b08649f847ef92a9557486">
+    <title>codeatlas-query
+read-only index + tools -&gt; codeatlas-agent
+tool loop + evidence gate: RepositoryTools executor</title>
+    <path d="M 1304 159 C 1352 159 1352 159 1400 159" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="1284" y="128" width="136" height="42" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="1352" y="145" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="1352" y="145">RepositoryTools</tspan>
+      <tspan x="1352" y="161">executor</tspan>
+    </text>
+  </g>
+  <g id="node-0" class="node" data-claim-ids="01e3d086934fe500edfaa19a29694ab8" data-evidence-ids="4f7195a6cf63518bd36ea0d0303ea22b dd058148c5bef394b457aba7e0c4988c c655bb3e3937453f28da87cd67bd493b">
+    <title>codeatlas-agent
+tool loop + evidence gate</title>
+    <rect x="1400" y="127" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="1508" y="155" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="1508" y="155">codeatlas-agent tool</tspan>
+      <tspan x="1508" y="173">loop + evidence gate</tspan>
+    </text>
+  </g>
+  <g id="node-1" class="node" data-claim-ids="b0ec22e49786fe2d811cd8c2dc940fd8" data-evidence-ids="bf038c185c4b81301f8f4c7190e036f0 baa909be39a22b9a6c661067fcd664df">
+    <title>codeatlas-app
+composition + dispatch</title>
+    <rect x="1712" y="127" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="1820" y="155" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="1820" y="155">codeatlas-app</tspan>
+      <tspan x="1820" y="173">composition + dispatch</tspan>
+    </text>
+  </g>
+  <g id="node-2" class="node" data-claim-ids="2b293d86486f23d6611c3fddecc5b4f9" data-evidence-ids="4935ca7097e691d4593a90a68542e618">
+    <title>codeatlas-core
+contracts + neutral IR</title>
+    <rect x="152" y="127" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="260" y="155" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="260" y="155">codeatlas-core</tspan>
+      <tspan x="260" y="173">contracts + neutral IR</tspan>
+    </text>
+  </g>
+  <g id="node-3" class="node" data-claim-ids="4ba24f2dd4b4a4b773cd63f891cae90e" data-evidence-ids="ecf9626b5d0c4714bc7b5d54f146d892 9d6455bf7f0b33b82524088505d0ace0">
+    <title>codeatlas-indexer
+scan + parse + assemble</title>
+    <rect x="776" y="127" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="884" y="155" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="884" y="155">codeatlas-indexer scan</tspan>
+      <tspan x="884" y="173">+ parse + assemble</tspan>
+    </text>
+  </g>
+  <g id="node-4" class="node" data-claim-ids="a39edbd6a500be050e10ae4208c13486" data-evidence-ids="f5280803a4e7aebefb3d6c1762155fbc 5c3e464a7bd223879b240eeaa2aa5d46">
+    <title>language parsers
+Rust + Python adapters</title>
+    <rect x="464" y="127" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="572" y="155" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="572" y="155">language parsers Rust</tspan>
+      <tspan x="572" y="173">+ Python adapters</tspan>
+    </text>
+  </g>
+  <g id="node-5" class="node" data-claim-ids="f4a895c329c8a2ebba787fa6fdbb1b52" data-evidence-ids="7650201de43a73a869d62a5ecb399569 20482840d05e30aefba88d8e85fc3a78">
+    <title>codeatlas-query
+read-only index + tools</title>
+    <rect x="1088" y="118" width="216" height="82" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="1196" y="146" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="1196" y="146">codeatlas-query</tspan>
+      <tspan x="1196" y="164">read-only index +</tspan>
+      <tspan x="1196" y="182">tools</tspan>
+    </text>
+  </g>
+  <g id="node-6" class="node" data-claim-ids="8f11b75f0cc716aea499b5390efa2ceb" data-evidence-ids="61f74a67958ada346fdffb3706dcb514">
+    <title>codeatlas-tui
+commands/events UI</title>
+    <rect x="2024" y="127" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="2132" y="155" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="2132" y="155">codeatlas-tui</tspan>
+      <tspan x="2132" y="173">commands/events UI</tspan>
+    </text>
+  </g>
+</svg>

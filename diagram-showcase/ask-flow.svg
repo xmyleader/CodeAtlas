@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="1184" viewBox="0 0 760 1184" role="img" aria-labelledby="diagram-title-0 diagram-description-0" data-kind="flow">
+  <title id="diagram-title-0">TUI question to grounded answer</title>
+  <desc id="diagram-description-0">CodeAtlas Flow diagram. Title: TUI question to grounded answer</desc>
+  <defs>
+    <marker id="arrowhead-0" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#7dd3fc"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="760" height="1184" fill="#080d18"/>
+  <text x="152" y="38" fill="#f8fafc" font-family="ui-monospace, monospace" font-size="18" font-weight="700">TUI question to grounded answer</text>
+  <text x="152" y="64" fill="#7dd3fc" font-family="ui-monospace, monospace" font-size="12" font-weight="700">FLOW</text>
+  <path d="M 152 76 L 608 76" fill="none" stroke="#263248" stroke-width="1"/>
+  <g id="edge-0" class="edge" data-claim-ids="20b406099f1e2b46ca3ca12c1b369e0b" data-evidence-ids="b09ca6c67dfafe70094290605f2c2c06">
+    <title>TuiApp
+submit_question -&gt; AppCommand::Ask: build command</title>
+    <path d="M 380 180 C 380 209 380 209 380 238" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="320" y="186" width="120" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="380" y="203" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="380" y="203">build command</tspan>
+    </text>
+  </g>
+  <g id="edge-1" class="edge" data-claim-ids="620d16c506b14b47e77a53b1fc2d3e7a" data-evidence-ids="a966bb11c7abac216eebb33e6a330e06">
+    <title>AppCommand::Ask -&gt; app dispatch
+handle_ask: dispatch async task</title>
+    <path d="M 380 300 C 380 329 380 329 380 358" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="296" y="306" width="168" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="380" y="323" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="380" y="323">dispatch async task</tspan>
+    </text>
+  </g>
+  <g id="edge-2" class="edge" data-claim-ids="e21f9152cdb61ba719ef29c99f1a7d78" data-evidence-ids="e96bb8935aab74b55f54681d772cf559">
+    <title>app dispatch
+handle_ask -&gt; AgentRuntime
+model/tool loop: run AgentRequest</title>
+    <path d="M 380 422 C 380 451 260 451 260 480" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="248" y="428" width="144" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="320" y="445" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="320" y="445">run AgentRequest</tspan>
+    </text>
+  </g>
+  <g id="edge-3" class="edge cycle-edge" data-claim-ids="ae95d547975ae68ceae4a703564ee297" data-evidence-ids="d81ea2cf536990879c9e06dcbe9f8f27">
+    <title>AgentRuntime
+model/tool loop -&gt; RepositoryTools
+read-only queries: execute registered tool</title>
+    <path d="M 260 544 C 260 592 500 592 500 544" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)" stroke-dasharray="8 7"/>
+    <rect x="300" y="571" width="160" height="42" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="380" y="588" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="380" y="588">execute registered</tspan>
+      <tspan x="380" y="604">tool</tspan>
+    </text>
+  </g>
+  <g id="edge-4" class="edge cycle-edge" data-claim-ids="ae95d547975ae68ceae4a703564ee297" data-evidence-ids="d81ea2cf536990879c9e06dcbe9f8f27">
+    <title>RepositoryTools
+read-only queries -&gt; AgentRuntime
+model/tool loop: data + Evidence envelope</title>
+    <path d="M 500 544 C 500 592 260 592 260 544" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)" stroke-dasharray="8 7"/>
+    <rect x="312" y="571" width="136" height="42" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="380" y="588" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="380" y="588">data + Evidence</tspan>
+      <tspan x="380" y="604">envelope</tspan>
+    </text>
+  </g>
+  <g id="edge-5" class="edge" data-claim-ids="b16d205b9236bb29d5bc073ae3d815ce" data-evidence-ids="3e7ea1eee9d995cf0e0b5a04cd90902b 888a24a5858180018ca9cf4bd8199471">
+    <title>AgentRuntime
+model/tool loop -&gt; Evidence validation
+AgentAnswer gate: finalize answer</title>
+    <path d="M 260 544 C 260 573 380 573 380 602" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="252" y="550" width="136" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="320" y="567" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="320" y="567">finalize answer</tspan>
+    </text>
+  </g>
+  <g id="edge-6" class="edge" data-claim-ids="eb132a5b75e4043ceac0c5893f15c5f9" data-evidence-ids="8ac9b22e4218b585f5bf243667dfba43">
+    <title>Evidence validation
+AgentAnswer gate -&gt; append_turn
+SessionStore::save: append revalidates</title>
+    <path d="M 380 666 C 380 695 380 695 380 724" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="300" y="672" width="160" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="380" y="689" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="380" y="689">append revalidates</tspan>
+    </text>
+  </g>
+  <g id="edge-7" class="edge" data-claim-ids="b1ff6128b3d8e99d06859b7135585fdb" data-evidence-ids="e400da8651f6a5406b36e72dcfbbf5bc fa7ffaeb180076b7d88e59b6ad3677e1">
+    <title>append_turn
+SessionStore::save -&gt; AppEvent
+AnswerCompleted: save before emit</title>
+    <path d="M 380 788 C 380 817 380 817 380 846" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="308" y="794" width="144" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="380" y="811" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="380" y="811">save before emit</tspan>
+    </text>
+  </g>
+  <g id="edge-8" class="edge" data-claim-ids="c6aa7a902a3040f5a7e2b7afbc5e8d13" data-evidence-ids="8666abe66aed8c39ac8fd1745797d114 d6214fe01f4c70d0ad0d860da1c2c6d5 893f9ec4665d2fd11013fd5a40ea86de">
+    <title>AppEvent
+AnswerCompleted -&gt; TUI reduce
+complete AnswerView: application event</title>
+    <path d="M 380 910 C 380 939 380 939 380 968" fill="none" stroke="#7dd3fc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowhead-0)"/>
+    <rect x="304" y="916" width="152" height="26" rx="5" fill="#111a2b" stroke="#334155" stroke-width="1"/>
+    <text x="380" y="933" text-anchor="middle" fill="#bae6fd" font-family="ui-monospace, monospace" font-size="12" font-weight="600">
+      <tspan x="380" y="933">application event</tspan>
+    </text>
+  </g>
+  <g id="node-0" class="node" data-claim-ids="20b406099f1e2b46ca3ca12c1b369e0b" data-evidence-ids="b09ca6c67dfafe70094290605f2c2c06">
+    <title>TuiApp
+submit_question</title>
+    <rect x="272" y="118" width="216" height="62" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="380" y="154" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="380" y="154">TuiApp submit_question</tspan>
+    </text>
+  </g>
+  <g id="node-1" class="node" data-claim-ids="4cbc51fa3b03ac6f4c23b7d5842f971a" data-evidence-ids="1645e485013073a6d69e12d44e6982f9">
+    <title>AppCommand::Ask</title>
+    <rect x="272" y="238" width="216" height="62" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="380" y="274" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="380" y="274">AppCommand::Ask</tspan>
+    </text>
+  </g>
+  <g id="node-2" class="node" data-claim-ids="e21f9152cdb61ba719ef29c99f1a7d78" data-evidence-ids="e96bb8935aab74b55f54681d772cf559">
+    <title>app dispatch
+handle_ask</title>
+    <rect x="272" y="358" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="380" y="386" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="380" y="386">app dispatch</tspan>
+      <tspan x="380" y="404">handle_ask</tspan>
+    </text>
+  </g>
+  <g id="node-3" class="node" data-claim-ids="e21f9152cdb61ba719ef29c99f1a7d78" data-evidence-ids="e96bb8935aab74b55f54681d772cf559">
+    <title>AgentRuntime
+model/tool loop</title>
+    <rect x="152" y="480" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="260" y="508" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="260" y="508">AgentRuntime</tspan>
+      <tspan x="260" y="526">model/tool loop</tspan>
+    </text>
+  </g>
+  <g id="node-4" class="node" data-claim-ids="ce6abbd3321c1f1fed93206a271c154e" data-evidence-ids="86ad2fa7caecf0d269520799575b1be6">
+    <title>RepositoryTools
+read-only queries</title>
+    <rect x="392" y="480" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="500" y="508" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="500" y="508">RepositoryTools</tspan>
+      <tspan x="500" y="526">read-only queries</tspan>
+    </text>
+  </g>
+  <g id="node-5" class="node" data-claim-ids="b16d205b9236bb29d5bc073ae3d815ce" data-evidence-ids="3e7ea1eee9d995cf0e0b5a04cd90902b 888a24a5858180018ca9cf4bd8199471">
+    <title>Evidence validation
+AgentAnswer gate</title>
+    <rect x="272" y="602" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="380" y="630" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="380" y="630">Evidence validation</tspan>
+      <tspan x="380" y="648">AgentAnswer gate</tspan>
+    </text>
+  </g>
+  <g id="node-6" class="node" data-claim-ids="b1ff6128b3d8e99d06859b7135585fdb" data-evidence-ids="e400da8651f6a5406b36e72dcfbbf5bc fa7ffaeb180076b7d88e59b6ad3677e1">
+    <title>append_turn
+SessionStore::save</title>
+    <rect x="272" y="724" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="380" y="752" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="380" y="752">append_turn</tspan>
+      <tspan x="380" y="770">SessionStore::save</tspan>
+    </text>
+  </g>
+  <g id="node-7" class="node" data-claim-ids="8194bdee10f7926f6f1efb1dcf0ac62a" data-evidence-ids="22bfec1ae1e3592326faf3d4e407f219 fa7ffaeb180076b7d88e59b6ad3677e1">
+    <title>AppEvent
+AnswerCompleted</title>
+    <rect x="272" y="846" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="380" y="874" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="380" y="874">AppEvent</tspan>
+      <tspan x="380" y="892">AnswerCompleted</tspan>
+    </text>
+  </g>
+  <g id="node-8" class="node" data-claim-ids="c6aa7a902a3040f5a7e2b7afbc5e8d13" data-evidence-ids="8666abe66aed8c39ac8fd1745797d114 d6214fe01f4c70d0ad0d860da1c2c6d5 893f9ec4665d2fd11013fd5a40ea86de">
+    <title>TUI reduce
+complete AnswerView</title>
+    <rect x="272" y="968" width="216" height="64" rx="12" fill="#111a2b" stroke="#52647f" stroke-width="2"/>
+    <text x="380" y="996" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace, monospace" font-size="14" font-weight="650">
+      <tspan x="380" y="996">TUI reduce complete</tspan>
+      <tspan x="380" y="1014">AnswerView</tspan>
+    </text>
+  </g>
+</svg>

@@ -1,0 +1,38 @@
+[package]
+name = "codeatlas-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "codeatlas"
+path = "src/main.rs"
+
+[[bin]]
+name = "codeatlas-gui"
+path = "src/bin/codeatlas-gui.rs"
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+codeatlas-agent = { path = "../codeatlas-agent" }
+codeatlas-core = { path = "../codeatlas-core" }
+codeatlas-diagram = { path = "../codeatlas-diagram" }
+codeatlas-gui = { path = "../codeatlas-gui" }
+codeatlas-indexer = { path = "../codeatlas-indexer" }
+codeatlas-lang-python = { path = "../codeatlas-lang-python" }
+codeatlas-lang-rust = { path = "../codeatlas-lang-rust" }
+codeatlas-query = { path = "../codeatlas-query" }
+codeatlas-tui = { path = "../codeatlas-tui" }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
