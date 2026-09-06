@@ -133,6 +133,8 @@ fn model_config(endpoint: String) -> ModelConfig {
     ModelConfig {
         endpoint,
         model: "test-model".to_owned(),
+        reasoning_mode: None,
+        reasoning_effort: None,
         temperature: Some(0.25),
         max_output_tokens: Some(321),
         context_window_tokens: Some(8_192),
@@ -233,12 +235,47 @@ async fn openai_client_serializes_config_tools_and_parses_tool_calls_and_usage()
     assert_eq!(payload["max_tokens"], 321);
     assert_eq!(payload["stream"], false);
     assert_eq!(payload["tool_choice"], "auto");
+    assert!(payload.get("reasoning_mode").is_none());
+    assert!(payload.get("reasoning_effort").is_none());
     assert_eq!(payload["tools"][0]["type"], "function");
     assert_eq!(payload["tools"][0]["function"]["name"], "read_source");
     assert_eq!(
         payload["tools"][0]["function"]["parameters"]["required"][0],
         "path"
     );
+}
+
+#[tokio::test]
+async fn openai_client_transmits_optional_reasoning_configuration() {
+    let response = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "{\"text\":\"answer\",\"claims\":[],\"call_paths\":[],\"diagram\":{\"decision\":\"not_needed\",\"reason\":\"not useful\"}}"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+    .to_string();
+    let (endpoint, raw_request, server) = serve_once(200, "OK", response).await;
+    let mut config = model_config(endpoint);
+    config.reasoning_mode = Some("enabled".to_owned());
+    config.reasoning_effort = Some("high".to_owned());
+    let client = OpenAiChatClient::new(config, RuntimeSecretHeaders::new()).expect("valid client");
+
+    client
+        .complete(request())
+        .await
+        .expect("reasoning request should complete");
+    let raw_request = raw_request.await.expect("captured HTTP request");
+    server.await.expect("mock server should finish");
+    let (_, body) = raw_request
+        .split_once("\r\n\r\n")
+        .expect("HTTP request body");
+    let payload: Value = serde_json::from_str(body).expect("request JSON");
+    assert_eq!(payload["reasoning_mode"], "enabled");
+    assert_eq!(payload["reasoning_effort"], "high");
 }
 
 #[tokio::test]
@@ -586,11 +623,35 @@ fn openai_client_rejects_invalid_construction_boundaries() {
         Err(OpenAiClientBuildError::EmptyModel)
     ));
 
+    let mut config = model_config("https://example.com/v1/chat/completions".to_owned());
+    config.max_output_tokens = Some(0);
+    assert!(matches!(
+        OpenAiChatClient::new(config, RuntimeSecretHeaders::new()),
+        Err(OpenAiClientBuildError::ZeroMaxOutputTokens)
+    ));
+
     let config = model_config("file:///tmp/chat-completions".to_owned());
     assert!(matches!(
         OpenAiChatClient::new(config, RuntimeSecretHeaders::new()),
         Err(OpenAiClientBuildError::InvalidEndpoint { .. })
     ));
+
+    let config = model_config("http://models.example.com/v1/chat/completions".to_owned());
+    let error = OpenAiChatClient::new(config, RuntimeSecretHeaders::new())
+        .expect_err("remote plaintext HTTP endpoint must be rejected");
+    assert!(error.to_string().contains("must use HTTPS"));
+
+    for endpoint in [
+        "http://localhost:11434/v1/chat/completions",
+        "http://127.0.0.1:11434/v1/chat/completions",
+        "http://[::1]:11434/v1/chat/completions",
+    ] {
+        OpenAiChatClient::new(
+            model_config(endpoint.to_owned()),
+            RuntimeSecretHeaders::new(),
+        )
+        .expect("explicit loopback HTTP endpoint should remain supported");
+    }
 }
 
 #[tokio::test]

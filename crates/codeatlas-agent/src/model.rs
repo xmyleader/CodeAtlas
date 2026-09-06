@@ -255,6 +255,15 @@ impl ModelError {
 /// Object-safe asynchronous model boundary used by [`crate::AgentRuntime`].
 #[async_trait]
 pub trait ModelClient: Send + Sync {
+    /// Returns the configured model identifier for request ledger records.
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "implementations backed by configuration return a value borrowed from self"
+    )]
+    fn model_name(&self) -> &str {
+        "unknown"
+    }
+
     /// Returns the configured model context window when it is known.
     fn context_window_tokens(&self) -> Option<u32> {
         None
@@ -328,6 +337,14 @@ impl std::fmt::Debug for MockModelClient {
 
 #[async_trait]
 impl ModelClient for MockModelClient {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "the trait permits configured implementations to borrow from self"
+    )]
+    fn model_name(&self) -> &str {
+        "mock"
+    }
+
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
         self.requests
             .lock()

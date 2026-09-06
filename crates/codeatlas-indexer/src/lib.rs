@@ -12,6 +12,7 @@ pub use diagnostic::{DiagnosticSeverity, DiagnosticStage, FileDiagnostic};
 pub use indexer::{IndexCounts, IndexError, IndexReport, Indexer, ProgressCallback};
 pub use registry::{ParserRegistry, RegistryError};
 pub use scanner::{
-    RepositoryScanner, ScanConfig, ScanError, ScanResult, ScannedFile, language_for_path,
+    CancellationCheck, RepositoryScanner, ScanConfig, ScanError, ScanResult, ScannedFile,
+    language_for_path,
 };
 pub use store::{CachedIndex, IndexStoreError, JsonIndexStore};

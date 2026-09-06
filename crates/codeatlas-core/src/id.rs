@@ -158,6 +158,7 @@ define_id!(ClaimId, "claim");
 define_id!(DiagramId, "diagram");
 define_id!(CallPathId, "call-path");
 define_id!(ToolCallId, "tool-call");
+define_id!(ModelCallId, "model-call");
 define_id!(RequestId, "request");
 define_id!(SessionId, "session");
 define_id!(AnswerId, "answer");

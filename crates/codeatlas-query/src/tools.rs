@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
 use codeatlas_core::{ToolCall, ToolDefinition, ToolError, ToolExecutor, ToolOutput};
@@ -48,7 +51,12 @@ impl RepositoryTools {
         definitions()
     }
 
-    fn dispatch(&self, name: &str, arguments: &Value) -> Result<Value, ToolError> {
+    fn dispatch(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancellation: &AtomicBool,
+    ) -> Result<Value, ToolError> {
         match name {
             "list_files" => self.run(name, arguments, RepositoryIndex::list_files),
             "read_file" => self.run(name, arguments, RepositoryIndex::read_file),
@@ -56,7 +64,7 @@ impl RepositoryTools {
             "find_references" => self.run(name, arguments, RepositoryIndex::find_references),
             "get_symbol" => self.run(name, arguments, RepositoryIndex::get_symbol),
             "get_module" => self.run(name, arguments, RepositoryIndex::get_module),
-            "search_code" => self.run(name, arguments, RepositoryIndex::search_code),
+            "search_code" => self.run_search(name, arguments, cancellation),
             "trace_call" => self.run(name, arguments, RepositoryIndex::trace_call),
             "get_repository_overview" => {
                 self.run(name, arguments, RepositoryIndex::get_repository_overview)
@@ -65,6 +73,23 @@ impl RepositoryTools {
                 name: name.to_owned(),
             }),
         }
+    }
+
+    fn run_search(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancellation: &AtomicBool,
+    ) -> Result<Value, ToolError> {
+        let arguments = parse_arguments(name, arguments)?;
+        let result = self
+            .index
+            .search_code_cancellable(&arguments, &|| cancellation.load(Ordering::Relaxed))
+            .map_err(|error| map_query_error(name, error))?;
+        serde_json::to_value(result).map_err(|error| ToolError::Execution {
+            name: name.to_owned(),
+            message: format!("failed to serialize query result: {error}"),
+        })
     }
 
     fn run<Q, R>(
@@ -93,8 +118,10 @@ impl ToolExecutor for RepositoryTools {
         let tools = self.clone();
         let call = call.clone();
         let name = call.name.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = tools.dispatch(&call.name, &call.arguments)?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut guard = CancellationGuard::new(Arc::clone(&cancellation));
+        let result = tokio::task::spawn_blocking(move || {
+            let result = tools.dispatch(&call.name, &call.arguments, &cancellation)?;
             Ok(ToolOutput {
                 call_id: call.id,
                 result,
@@ -105,7 +132,35 @@ impl ToolExecutor for RepositoryTools {
         .map_err(|error| ToolError::Execution {
             name,
             message: format!("blocking task failed: {error}"),
-        })?
+        })?;
+        guard.disarm();
+        result
+    }
+}
+
+struct CancellationGuard {
+    cancellation: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    const fn new(cancellation: Arc<AtomicBool>) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -118,6 +173,7 @@ fn parse_arguments<T: DeserializeOwned>(name: &str, arguments: &Value) -> Result
 
 fn map_query_error(name: &str, error: QueryError) -> ToolError {
     match error {
+        QueryError::Cancelled => ToolError::Cancelled,
         QueryError::InvalidQuery { message } => ToolError::InvalidArguments {
             name: name.to_owned(),
             message,

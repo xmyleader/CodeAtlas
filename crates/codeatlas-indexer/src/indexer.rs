@@ -6,9 +6,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    CachedIndex, DiagnosticSeverity, DiagnosticStage, FileDiagnostic, IndexAssembler,
-    JsonIndexStore, ParserRegistry, RepositoryScanner, RepositorySpec, ScanConfig, ScanError,
-    assembler::sort_model, scanner::diagnostic_order,
+    CachedIndex, CancellationCheck, DiagnosticSeverity, DiagnosticStage, FileDiagnostic,
+    IndexAssembler, IndexStoreError, JsonIndexStore, ParserRegistry, RepositoryScanner,
+    RepositorySpec, ScanConfig, ScanError, assembler::sort_model, scanner::diagnostic_order,
 };
 
 const INDEX_FINGERPRINT_DOMAIN: &[u8] = b"codeatlas-index-fingerprint-v1";
@@ -85,6 +85,24 @@ impl Indexer {
         repository: RepositorySpec,
         progress: Option<&ProgressCallback<'_>>,
     ) -> Result<IndexReport, IndexError> {
+        self.index_cancellable(root, repository, progress, None)
+    }
+
+    /// Indexes a repository with cooperative cancellation at scan, parse,
+    /// assembly, and cache persistence boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] when scanning fails or cancellation is requested.
+    #[allow(clippy::too_many_lines)]
+    pub fn index_cancellable(
+        &self,
+        root: impl AsRef<Path>,
+        repository: RepositorySpec,
+        progress: Option<&ProgressCallback<'_>>,
+        cancellation: Option<&CancellationCheck<'_>>,
+    ) -> Result<IndexReport, IndexError> {
+        ensure_active(cancellation)?;
         emit_progress(
             progress,
             ProgressPhase::Scanning,
@@ -92,7 +110,13 @@ impl Indexer {
             Some(0),
             None,
         );
-        let scan = self.scanner.scan(root)?;
+        let scan =
+            self.scanner
+                .scan_cancellable(root, cancellation)
+                .map_err(|error| match error {
+                    ScanError::Cancelled => IndexError::Cancelled,
+                    error => IndexError::Scan(error),
+                })?;
         let scanned_files = u64::try_from(scan.files.len()).unwrap_or(u64::MAX);
         emit_progress(
             progress,
@@ -103,12 +127,14 @@ impl Indexer {
         );
 
         let fingerprint = self.index_fingerprint(&scan.fingerprint);
+        ensure_active(cancellation)?;
         let repository_id = repository.repository_id();
         let repository_name = repository.name.clone();
         let cache_key = repository_id.to_string();
         let mut diagnostics = scan.diagnostics;
         if let Some(store) = &self.store {
-            match store.read(&cache_key) {
+            ensure_active(cancellation)?;
+            match store.read_cancellable(&cache_key, cancellation) {
                 Ok(Some(cached))
                     if cached.fingerprint == fingerprint
                         && cached.model.repository_id == repository_id
@@ -116,6 +142,7 @@ impl Indexer {
                 {
                     diagnostics.extend(cached.diagnostics);
                     diagnostics.sort_by(diagnostic_order);
+                    ensure_active(cancellation)?;
                     emit_progress(
                         progress,
                         ProgressPhase::Indexing,
@@ -135,6 +162,7 @@ impl Indexer {
                     });
                 }
                 Ok(_) => {}
+                Err(IndexStoreError::Cancelled) => return Err(IndexError::Cancelled),
                 Err(error) => diagnostics.push(FileDiagnostic::new(
                     None,
                     DiagnosticStage::Cache,
@@ -150,6 +178,7 @@ impl Indexer {
         let mut parse_skipped_files = 0_u64;
         let mut parsed_count = 0_u64;
         for (index, file) in scan.files.iter().enumerate() {
+            ensure_active(cancellation)?;
             emit_progress(
                 progress,
                 ProgressPhase::Parsing,
@@ -179,6 +208,7 @@ impl Indexer {
                     ));
                 }
             }
+            ensure_active(cancellation)?;
         }
         emit_progress(
             progress,
@@ -192,6 +222,7 @@ impl Indexer {
         let assembler = IndexAssembler::new(repository);
         let parsed_total = u64::try_from(parsed_files.len()).unwrap_or(u64::MAX);
         for (index, parsed_file) in parsed_files.into_iter().enumerate() {
+            ensure_active(cancellation)?;
             emit_progress(
                 progress,
                 ProgressPhase::Indexing,
@@ -213,9 +244,12 @@ impl Indexer {
                     ));
                 }
             }
+            ensure_active(cancellation)?;
         }
+        ensure_active(cancellation)?;
         sort_model(&mut model);
         diagnostics.sort_by(diagnostic_order);
+        ensure_active(cancellation)?;
 
         let counts = IndexCounts {
             scanned_files,
@@ -230,6 +264,7 @@ impl Indexer {
         };
 
         if let Some(store) = &self.store {
+            ensure_active(cancellation)?;
             let cached_diagnostics = report
                 .diagnostics
                 .iter()
@@ -248,7 +283,10 @@ impl Indexer {
                 skipped_files: parse_skipped_files,
                 diagnostics: cached_diagnostics,
             };
-            if let Err(error) = store.write(&cache_key, &cached) {
+            if let Err(error) = store.write_cancellable(&cache_key, &cached, cancellation) {
+                if matches!(error, IndexStoreError::Cancelled) {
+                    return Err(IndexError::Cancelled);
+                }
                 report.diagnostics.push(FileDiagnostic::new(
                     None,
                     DiagnosticStage::Cache,
@@ -260,6 +298,7 @@ impl Indexer {
             }
         }
 
+        ensure_active(cancellation)?;
         emit_progress(
             progress,
             ProgressPhase::Indexing,
@@ -293,6 +332,16 @@ impl Default for Indexer {
 pub enum IndexError {
     #[error(transparent)]
     Scan(#[from] ScanError),
+    #[error("repository indexing was cancelled")]
+    Cancelled,
+}
+
+fn ensure_active(cancellation: Option<&CancellationCheck<'_>>) -> Result<(), IndexError> {
+    if cancellation.is_some_and(|check| check()) {
+        Err(IndexError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn emit_progress(

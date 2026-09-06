@@ -12,6 +12,7 @@ path = "src/main.rs"
 [[bin]]
 name = "codeatlas-gui"
 path = "src/bin/codeatlas-gui.rs"
+doc = false
 
 [dependencies]
 async-trait = "0.1"

@@ -8,13 +8,17 @@ use std::{
 };
 
 use codeatlas_core::{
-    AgentAnswer, Cost, ModelUsage, RepositoryId, RequestId, SessionId, TokenUsage, WorkflowEvent,
+    AgentAnswer, AnswerId, AppError, BudgetStopReason, Cost, ExplanationProfile, ModelBudgetStatus,
+    ModelCallRecord, ModelUsage, RepositoryId, RequestId, SessionId, SessionTaskStatus, TokenUsage,
+    WorkflowEvent,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const SESSION_SCHEMA_VERSION: u32 = 2;
-const LEGACY_SESSION_SCHEMA_VERSION: u32 = 1;
+use crate::{ModelMessage, ModelRole};
+
+pub const SESSION_SCHEMA_VERSION: u32 = 3;
+const LEGACY_SESSION_SCHEMA_VERSIONS: [u32; 2] = [1, 2];
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -36,9 +40,30 @@ pub struct ConversationMessage {
 pub struct ConversationTurn {
     pub request_id: RequestId,
     pub question: String,
-    pub answer: AgentAnswer,
     #[serde(default)]
-    pub workflow: Vec<WorkflowEvent>,
+    pub profile: ExplanationProfile,
+    pub status: SessionTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<AgentAnswer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_error: Option<AppError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_stop_reason: Option<BudgetStopReason>,
+    #[serde(default)]
+    pub started_at_unix_ms: u64,
+    #[serde(default)]
+    pub finished_at_unix_ms: u64,
+    #[serde(default)]
+    pub trajectory: Vec<WorkflowEvent>,
+    #[serde(default)]
+    pub model_calls: Vec<ModelCallRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ModelUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<ModelBudgetStatus>,
+    /// Complete prior observable messages without a system instruction.
+    #[serde(default)]
+    pub continuation: Vec<ModelMessage>,
 }
 
 /// Serializable, UI-neutral state for one repository conversation.
@@ -53,6 +78,68 @@ pub struct SessionState {
     pub created_at_unix_ms: u64,
     #[serde(default)]
     pub updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyConversationTurn {
+    request_id: RequestId,
+    question: String,
+    #[serde(default)]
+    profile: ExplanationProfile,
+    answer: AgentAnswer,
+    #[serde(default)]
+    workflow: Vec<WorkflowEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacySessionState {
+    session_id: SessionId,
+    repository_id: RepositoryId,
+    turns: Vec<LegacyConversationTurn>,
+    usage: ModelUsage,
+    #[serde(default)]
+    created_at_unix_ms: u64,
+    #[serde(default)]
+    updated_at_unix_ms: u64,
+}
+
+impl LegacySessionState {
+    fn migrate(self) -> SessionState {
+        SessionState {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: self.session_id,
+            repository_id: self.repository_id,
+            turns: self
+                .turns
+                .into_iter()
+                .map(|turn| {
+                    let usage = turn.answer.usage.clone();
+                    ConversationTurn {
+                        request_id: turn.request_id,
+                        continuation: vec![
+                            ModelMessage::user(turn.question.clone()),
+                            ModelMessage::assistant(turn.answer.text.clone()),
+                        ],
+                        question: turn.question,
+                        profile: turn.profile,
+                        status: SessionTaskStatus::Completed,
+                        answer: Some(turn.answer),
+                        terminal_error: None,
+                        budget_stop_reason: None,
+                        started_at_unix_ms: self.created_at_unix_ms,
+                        finished_at_unix_ms: self.updated_at_unix_ms,
+                        trajectory: turn.workflow,
+                        model_calls: Vec::new(),
+                        usage,
+                        budget: None,
+                    }
+                })
+                .collect(),
+            usage: self.usage,
+            created_at_unix_ms: self.created_at_unix_ms,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+        }
+    }
 }
 
 impl SessionState {
@@ -77,8 +164,7 @@ impl SessionState {
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] for invalid evidence, a duplicate request ID,
-    /// or incompatible cost currencies.
+    /// Returns [`SessionError`] for invalid evidence or a duplicate request ID.
     pub fn append_turn(
         &mut self,
         request_id: RequestId,
@@ -92,8 +178,7 @@ impl SessionState {
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] for invalid evidence, a duplicate request ID,
-    /// or incompatible cost currencies.
+    /// Returns [`SessionError`] for invalid evidence or a duplicate request ID.
     pub fn append_turn_with_workflow(
         &mut self,
         request_id: RequestId,
@@ -109,32 +194,97 @@ impl SessionState {
         if self.turns.iter().any(|turn| turn.request_id == request_id) {
             return Err(SessionError::DuplicateRequest { request_id });
         }
-        let usage = merge_usage(&self.usage, answer.usage.as_ref())?;
+        if self.turns.iter().any(|turn| {
+            turn.answer
+                .as_ref()
+                .is_some_and(|existing| existing.id == answer.id)
+        }) {
+            return Err(SessionError::DuplicateAnswer {
+                answer_id: answer.id,
+            });
+        }
+        let question = question.into();
+        let task_usage = answer.usage.clone();
+        let now = current_unix_ms();
         self.turns.push(ConversationTurn {
             request_id,
-            question: question.into(),
-            answer,
-            workflow,
+            continuation: vec![
+                ModelMessage::user(question.clone()),
+                ModelMessage::assistant(answer.text.clone()),
+            ],
+            question,
+            profile: ExplanationProfile::default(),
+            status: SessionTaskStatus::Completed,
+            answer: Some(answer),
+            terminal_error: None,
+            budget_stop_reason: None,
+            started_at_unix_ms: now,
+            finished_at_unix_ms: now,
+            trajectory: workflow,
+            model_calls: Vec::new(),
+            usage: task_usage,
+            budget: None,
         });
-        self.usage = usage;
+        self.usage = aggregate_turn_usage(&self.turns);
         self.updated_at_unix_ms = current_unix_ms();
         Ok(())
     }
 
     #[must_use]
-    pub fn conversation_history(&self) -> Vec<ConversationMessage> {
-        let mut history = Vec::with_capacity(self.turns.len().saturating_mul(2));
+    pub fn conversation_history(&self) -> Vec<ModelMessage> {
+        let mut history = Vec::new();
         for turn in &self.turns {
-            history.push(ConversationMessage {
-                role: ConversationRole::User,
-                content: turn.question.clone(),
-            });
-            history.push(ConversationMessage {
-                role: ConversationRole::Assistant,
-                content: turn.answer.text.clone(),
-            });
+            if turn.status == SessionTaskStatus::Completed {
+                let mut continuation = turn.continuation.clone();
+                if let Some(answer) = &turn.answer
+                    && let Some(message) = continuation.iter_mut().rev().find(|message| {
+                        message.role == ModelRole::Assistant && message.content.is_some()
+                    })
+                    && let Some(content) = message.content.take()
+                {
+                    message.content = Some(format!(
+                        "[CodeAtlas persisted answer {}]\n{content}",
+                        answer.id
+                    ));
+                }
+                history.extend(continuation);
+            }
         }
         history
+    }
+
+    /// Appends any terminal task, including failures and cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] for invalid data or duplicate request IDs.
+    pub fn append_task(&mut self, turn: ConversationTurn) -> Result<(), SessionError> {
+        validate_turn(&turn)?;
+        if self
+            .turns
+            .iter()
+            .any(|existing| existing.request_id == turn.request_id)
+        {
+            return Err(SessionError::DuplicateRequest {
+                request_id: turn.request_id,
+            });
+        }
+        if let Some(answer) = &turn.answer
+            && self.turns.iter().any(|existing| {
+                existing
+                    .answer
+                    .as_ref()
+                    .is_some_and(|existing| existing.id == answer.id)
+            })
+        {
+            return Err(SessionError::DuplicateAnswer {
+                answer_id: answer.id,
+            });
+        }
+        self.turns.push(turn);
+        self.usage = aggregate_turn_usage(&self.turns);
+        self.updated_at_unix_ms = current_unix_ms();
+        Ok(())
     }
 
     /// Recalculates the aggregate estimated cost with explicit prices.
@@ -147,11 +297,21 @@ impl SessionState {
         let mut amount = 0.0;
         let mut has_usage = false;
         for turn in &mut self.turns {
-            if let Some(usage) = &mut turn.answer.usage {
+            if turn.usage.is_none() {
+                turn.usage = turn.answer.as_ref().and_then(|answer| answer.usage.clone());
+            }
+            if let Some(usage) = &mut turn.usage {
                 has_usage = true;
                 let cost = pricing.estimate(&usage.tokens)?;
                 amount += cost.amount;
-                usage.cost = Some(cost);
+                usage.cost = Some(cost.clone());
+                if let Some(answer_usage) = turn
+                    .answer
+                    .as_mut()
+                    .and_then(|answer| answer.usage.as_mut())
+                {
+                    answer_usage.cost = Some(cost);
+                }
             }
         }
         self.usage.cost = has_usage.then(|| Cost {
@@ -163,35 +323,30 @@ impl SessionState {
     }
 }
 
-fn merge_usage(
-    current: &ModelUsage,
-    additional: Option<&ModelUsage>,
-) -> Result<ModelUsage, SessionError> {
-    let Some(additional) = additional else {
-        return Ok(current.clone());
-    };
-    let tokens = add_token_usage(current.tokens, additional.tokens);
-    let current_has_tokens = current.tokens.total_tokens > 0;
-    let additional_has_tokens = additional.tokens.total_tokens > 0;
-    let cost = match (&current.cost, &additional.cost) {
-        (Some(left), Some(right)) => {
-            if left.currency != right.currency {
-                return Err(SessionError::CurrencyMismatch {
-                    expected: left.currency.clone(),
-                    actual: right.currency.clone(),
-                });
+fn aggregate_turn_usage(turns: &[ConversationTurn]) -> ModelUsage {
+    let mut tokens = TokenUsage::default();
+    let mut cost = None::<Cost>;
+    let mut cost_unavailable = false;
+    for usage in turns.iter().filter_map(turn_usage) {
+        tokens = add_token_usage(tokens, usage.tokens);
+        match (&mut cost, &usage.cost) {
+            (_, None) if usage.tokens.total_tokens > 0 => {
+                cost = None;
+                cost_unavailable = true;
             }
-            Some(Cost {
-                currency: left.currency.clone(),
-                amount: left.amount + right.amount,
-                estimated: left.estimated || right.estimated,
-            })
+            (Some(total), Some(additional)) if total.currency == additional.currency => {
+                total.amount += additional.amount;
+                total.estimated |= additional.estimated;
+            }
+            (None, Some(additional)) if !cost_unavailable => cost = Some(additional.clone()),
+            (Some(_), Some(_)) => {
+                cost = None;
+                cost_unavailable = true;
+            }
+            _ => {}
         }
-        (None, Some(cost)) if !current_has_tokens => Some(cost.clone()),
-        (Some(cost), None) if !additional_has_tokens => Some(cost.clone()),
-        _ => None,
-    };
-    Ok(ModelUsage { tokens, cost })
+    }
+    ModelUsage { tokens, cost }
 }
 
 #[must_use]
@@ -370,6 +525,31 @@ impl SessionStore {
     ///
     /// Returns [`SessionError`] on the first unreadable or invalid document.
     pub fn load_all(&self) -> Result<Vec<SessionState>, SessionError> {
+        let paths = self.session_paths()?;
+        paths.iter().map(|path| Self::load_path(path)).collect()
+    }
+
+    /// Restores every valid session while reporting corrupt individual files.
+    /// Directory-level storage failures are still returned because enumeration
+    /// itself cannot be trusted in that case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when the storage directory cannot be safely read.
+    pub fn load_all_lossy(&self) -> Result<(Vec<SessionState>, Vec<String>), SessionError> {
+        let paths = self.session_paths()?;
+        let mut sessions = Vec::with_capacity(paths.len());
+        let mut diagnostics = Vec::new();
+        for path in paths {
+            match Self::load_path(&path) {
+                Ok(session) => sessions.push(session),
+                Err(error) => diagnostics.push(error.to_string()),
+            }
+        }
+        Ok((sessions, diagnostics))
+    }
+
+    fn session_paths(&self) -> Result<Vec<PathBuf>, SessionError> {
         match fs::symlink_metadata(&self.directory) {
             Ok(_) => self.validate_directory()?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -392,7 +572,7 @@ impl SessionStore {
             }
         }
         paths.sort();
-        paths.iter().map(|path| Self::load_path(path)).collect()
+        Ok(paths)
     }
 
     fn load_path(path: &Path) -> Result<SessionState, SessionError> {
@@ -402,21 +582,38 @@ impl SessionStore {
             path: path.to_owned(),
             source,
         })?;
-        let mut state: SessionState =
+        let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|source| SessionError::Deserialize {
                 path: path.to_owned(),
                 source,
             })?;
-        match state.schema_version {
-            LEGACY_SESSION_SCHEMA_VERSION => state.schema_version = SESSION_SCHEMA_VERSION,
-            SESSION_SCHEMA_VERSION => {}
+        let schema_version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .unwrap_or_default();
+        let mut state = match schema_version {
+            actual if LEGACY_SESSION_SCHEMA_VERSIONS.contains(&actual) => {
+                serde_json::from_value::<LegacySessionState>(value)
+                    .map(LegacySessionState::migrate)
+                    .map_err(|source| SessionError::Deserialize {
+                        path: path.to_owned(),
+                        source,
+                    })?
+            }
+            SESSION_SCHEMA_VERSION => {
+                serde_json::from_value(value).map_err(|source| SessionError::Deserialize {
+                    path: path.to_owned(),
+                    source,
+                })?
+            }
             actual => {
                 return Err(SessionError::UnsupportedSchema {
                     expected: SESSION_SCHEMA_VERSION,
                     actual,
                 });
             }
-        }
+        };
         normalize_timestamps(&mut state);
         validate_state(&state)?;
         Ok(state)
@@ -531,25 +728,80 @@ fn validate_state(state: &SessionState) -> Result<(), SessionError> {
         });
     }
     let mut requests = HashSet::with_capacity(state.turns.len());
-    let mut recalculated = ModelUsage {
-        tokens: TokenUsage::default(),
-        cost: None,
-    };
+    let mut answers = HashSet::with_capacity(state.turns.len());
     for turn in &state.turns {
         if !requests.insert(turn.request_id) {
             return Err(SessionError::DuplicateRequest {
                 request_id: turn.request_id,
             });
         }
-        turn.answer
-            .validate_evidence()
-            .map_err(|error| SessionError::InvalidAnswer {
-                message: error.to_string(),
-            })?;
-        recalculated = merge_usage(&recalculated, turn.answer.usage.as_ref())?;
+        validate_turn(turn)?;
+        if let Some(answer) = &turn.answer
+            && !answers.insert(answer.id)
+        {
+            return Err(SessionError::DuplicateAnswer {
+                answer_id: answer.id,
+            });
+        }
     }
+    let recalculated = aggregate_turn_usage(&state.turns);
     if recalculated != state.usage {
         return Err(SessionError::UsageMismatch);
+    }
+    Ok(())
+}
+
+fn turn_usage(turn: &ConversationTurn) -> Option<&ModelUsage> {
+    turn.usage.as_ref().or_else(|| {
+        turn.answer
+            .as_ref()
+            .and_then(|answer| answer.usage.as_ref())
+    })
+}
+
+fn validate_turn(turn: &ConversationTurn) -> Result<(), SessionError> {
+    match turn.status {
+        SessionTaskStatus::Completed => {
+            let answer = turn.answer.as_ref().ok_or(SessionError::MissingAnswer)?;
+            answer
+                .validate_evidence()
+                .map_err(|error| SessionError::InvalidAnswer {
+                    message: error.to_string(),
+                })?;
+        }
+        SessionTaskStatus::Failed
+        | SessionTaskStatus::Cancelled
+        | SessionTaskStatus::BudgetExceeded => {
+            if turn.answer.is_some() {
+                return Err(SessionError::UnexpectedAnswer);
+            }
+        }
+    }
+    if turn.status == SessionTaskStatus::BudgetExceeded && turn.budget_stop_reason.is_none() {
+        return Err(SessionError::MissingBudgetReason);
+    }
+    if turn.finished_at_unix_ms != 0
+        && turn.started_at_unix_ms != 0
+        && turn.finished_at_unix_ms < turn.started_at_unix_ms
+    {
+        return Err(SessionError::InvalidTaskTimestamps);
+    }
+    let trajectory_calls = turn
+        .trajectory
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ModelCall(record) => Some(record),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !trajectory_calls.is_empty()
+        && (trajectory_calls.len() != turn.model_calls.len()
+            || trajectory_calls
+                .iter()
+                .zip(&turn.model_calls)
+                .any(|(left, right)| *left != right))
+    {
+        return Err(SessionError::ModelLedgerMismatch);
     }
     Ok(())
 }
@@ -565,12 +817,22 @@ pub enum SessionError {
     },
     #[error("request {request_id} already exists in the session")]
     DuplicateRequest { request_id: RequestId },
+    #[error("answer {answer_id} already exists in the session")]
+    DuplicateAnswer { answer_id: AnswerId },
     #[error("session contains an invalid answer: {message}")]
     InvalidAnswer { message: String },
+    #[error("a completed session task is missing its answer")]
+    MissingAnswer,
+    #[error("a non-completed session task unexpectedly contains an answer")]
+    UnexpectedAnswer,
+    #[error("a budget-exceeded session task is missing its stop reason")]
+    MissingBudgetReason,
+    #[error("session task completion precedes its start timestamp")]
+    InvalidTaskTimestamps,
+    #[error("session task model-call ledger does not match its trajectory")]
+    ModelLedgerMismatch,
     #[error("session usage does not equal the aggregate turn usage")]
     UsageMismatch,
-    #[error("cannot aggregate costs in {actual}; expected {expected}")]
-    CurrencyMismatch { expected: String, actual: String },
     #[error("unsafe session storage path: {path}")]
     UnsafeStoragePath { path: PathBuf },
     #[error("failed to serialize session: {0}")]

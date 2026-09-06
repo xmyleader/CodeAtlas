@@ -1,15 +1,204 @@
 use codeatlas_core::{
-    AgentAnswer, AnswerId, AppCommand, AppEvent, CallEdge, CallEdgeId, Claim, ClaimId, ClaimKind,
-    Diagram, DiagramArtifact, DiagramDecision, DiagramEdge, DiagramId, DiagramKind, DiagramNode,
-    Evidence, EvidenceId, EvidenceValidationError, FileId, FileInfo, Language, ModelUsage,
+    AgentAnswer, AnswerId, AppCommand, AppEvent, CallEdge, CallEdgeId, CallPath, CallPathId, Claim,
+    ClaimId, ClaimKind, Diagram, DiagramArtifact, DiagramDecision, DiagramEdge, DiagramId,
+    DiagramKind, DiagramNode, Evidence, EvidenceId, EvidenceValidationError, ExplanationAudience,
+    ExplanationDepth, ExplanationProfile, FileId, FileInfo, Language, ModelBudget,
+    ModelBudgetStatus, ModelCallId, ModelCallOutcome, ModelCallRecord, ModelConfig, ModelUsage,
     Progress, ProgressPhase, RepositoryId, RepositoryModel, RepositoryPath, RequestId,
-    SessionContext, SessionId, SessionSummary, SessionTask, SessionTaskSummary, SourceSpan, Symbol,
-    SymbolId, SymbolKind, TargetResolution, TokenUsage, ToolCall, ToolCallId, UnresolvedTarget,
-    WorkflowEvent,
+    SessionContext, SessionId, SessionSummary, SessionTask, SessionTaskSummary, SourceSpan,
+    SuggestedAction, Symbol, SymbolId, SymbolKind, TargetResolution, TokenUsage, ToolCall,
+    ToolCallId, UnresolvedTarget, WorkflowEvent,
 };
 
 fn id_parts() -> [&'static str; 3] {
     ["src/lib.rs", "function", "codeatlas_core::run"]
+}
+
+#[test]
+fn model_cost_control_contracts_are_compatible_and_round_trip() {
+    let legacy = serde_json::json!({
+        "endpoint": "https://models.example/v1/chat/completions",
+        "model": "test-model",
+        "temperature": null,
+        "max_output_tokens": null,
+        "context_window_tokens": null
+    });
+    let config: ModelConfig = serde_json::from_value(legacy).expect("legacy model config");
+    assert_eq!(config.reasoning_mode, None);
+    assert_eq!(config.reasoning_effort, None);
+
+    let request_id = RequestId::from_stable_parts(&["model-call-contract"]);
+    let usage = TokenUsage {
+        input_tokens: 8,
+        output_tokens: 2,
+        cached_input_tokens: 3,
+        total_tokens: 10,
+    };
+    for event in [
+        AppEvent::ModelCallRecorded {
+            request_id,
+            record: ModelCallRecord {
+                id: ModelCallId::from_stable_parts(&["model-call-contract", "1"]),
+                sequence: 1,
+                model: "test-model".to_owned(),
+                outcome: ModelCallOutcome::Succeeded,
+                usage: Some(usage),
+                cost: None,
+            },
+        },
+        AppEvent::BudgetUpdated {
+            request_id,
+            status: ModelBudgetStatus {
+                budget: ModelBudget {
+                    max_total_tokens: Some(100),
+                    max_cost: None,
+                },
+                usage: ModelUsage {
+                    tokens: usage,
+                    cost: None,
+                },
+            },
+        },
+    ] {
+        let encoded = serde_json::to_string(&event).expect("event serialization");
+        let decoded: AppEvent = serde_json::from_str(&encoded).expect("event deserialization");
+        assert_eq!(decoded, event);
+    }
+}
+
+#[test]
+fn explanation_profiles_default_and_legacy_commands_remain_compatible() {
+    let profile: ExplanationProfile =
+        serde_json::from_value(serde_json::json!({})).expect("empty profile uses defaults");
+    assert_eq!(profile, ExplanationProfile::default());
+    assert_eq!(profile.audience, ExplanationAudience::Developer);
+    assert_eq!(profile.depth, ExplanationDepth::Auto);
+
+    let request_id = RequestId::from_stable_parts(&["legacy-ask"]);
+    let session_id = SessionId::from_stable_parts(&["legacy-ask"]);
+    let repository_id = RepositoryId::from_stable_parts(&["legacy-ask"]);
+    let legacy = serde_json::json!({
+        "type": "ask",
+        "data": {
+            "request_id": request_id,
+            "session_id": session_id,
+            "repository_id": repository_id,
+            "question": "How does this work?"
+        }
+    });
+    let command: AppCommand =
+        serde_json::from_value(legacy).expect("legacy ask should deserialize");
+    assert_eq!(
+        command,
+        AppCommand::Ask {
+            request_id,
+            session_id,
+            repository_id,
+            question: "How does this work?".to_owned(),
+            profile: ExplanationProfile::default(),
+        }
+    );
+}
+
+#[test]
+fn suggested_actions_are_additive_bounded_and_reference_validated() {
+    let mut answer = diagram_answer(DiagramKind::Architecture);
+    let claim_id = answer.claims[0].id;
+    let evidence_id = answer.evidence[0].id;
+    answer.suggested_actions = vec![
+        SuggestedAction::DeepenClaim { claim_id },
+        SuggestedAction::ShowSource { evidence_id },
+        SuggestedAction::ChangeDepth {
+            depth: ExplanationDepth::Workflow,
+        },
+    ];
+    assert_eq!(answer.validate_evidence(), Ok(()));
+    assert!(
+        answer
+            .suggested_actions
+            .iter()
+            .all(|action| action.label().chars().count() <= 64)
+    );
+
+    let encoded = serde_json::to_value(&answer).expect("answer should serialize");
+    let decoded: AgentAnswer = serde_json::from_value(encoded).expect("answer should deserialize");
+    assert_eq!(decoded, answer);
+
+    let action_command = AppCommand::RunSuggestedAction {
+        request_id: RequestId::from_stable_parts(&["suggested-action-command"]),
+        session_id: SessionId::from_stable_parts(&["suggested-action-command"]),
+        repository_id: RepositoryId::from_stable_parts(&["suggested-action-command"]),
+        answer_id: answer.id,
+        action: answer.suggested_actions[1],
+    };
+    let encoded = serde_json::to_string(&action_command).expect("action command should serialize");
+    assert_eq!(
+        serde_json::from_str::<AppCommand>(&encoded).expect("action command should deserialize"),
+        action_command
+    );
+
+    answer.suggested_actions = vec![SuggestedAction::DeepenClaim {
+        claim_id: ClaimId::from_stable_parts(&["unknown-suggested-claim"]),
+    }];
+    assert!(matches!(
+        answer.validate_evidence(),
+        Err(EvidenceValidationError::UnknownSuggestedClaim { .. })
+    ));
+
+    answer.suggested_actions = vec![
+        SuggestedAction::ChangeDepth {
+            depth: ExplanationDepth::Auto,
+        },
+        SuggestedAction::ChangeDepth {
+            depth: ExplanationDepth::Overview,
+        },
+        SuggestedAction::ChangeDepth {
+            depth: ExplanationDepth::Architecture,
+        },
+        SuggestedAction::ChangeDepth {
+            depth: ExplanationDepth::Workflow,
+        },
+        SuggestedAction::ChangeDepth {
+            depth: ExplanationDepth::Code,
+        },
+    ];
+    assert_eq!(
+        answer.validate_evidence(),
+        Err(EvidenceValidationError::TooManySuggestedActions { actual: 5 })
+    );
+
+    assert!(
+        serde_json::from_value::<SuggestedAction>(serde_json::json!({
+            "kind": "show_source",
+            "evidence_id": "not-an-evidence-id"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn answer_local_claim_and_call_path_ids_must_be_unique() {
+    let mut duplicate_claim = diagram_answer(DiagramKind::Architecture);
+    duplicate_claim
+        .claims
+        .push(duplicate_claim.claims[0].clone());
+    assert!(matches!(
+        duplicate_claim.validate_evidence(),
+        Err(EvidenceValidationError::DuplicateClaim { .. })
+    ));
+
+    let mut duplicate_path = diagram_answer(DiagramKind::Architecture);
+    let path = CallPath {
+        id: CallPathId::from_stable_parts(&["duplicate-path"]),
+        label: None,
+        steps: Vec::new(),
+        complete: false,
+    };
+    duplicate_path.call_paths = vec![path.clone(), path];
+    assert!(matches!(
+        duplicate_path.validate_evidence(),
+        Err(EvidenceValidationError::DuplicateCallPath { .. })
+    ));
 }
 
 #[test]
@@ -80,6 +269,7 @@ fn diagram_answer(kind: DiagramKind) -> AgentAnswer {
                 }),
             },
         },
+        suggested_actions: Vec::new(),
         usage: None,
     }
 }
@@ -208,6 +398,7 @@ fn fact_without_evidence_is_reported() {
         evidence: Vec::new(),
         call_paths: Vec::new(),
         diagram: DiagramDecision::default(),
+        suggested_actions: Vec::new(),
         usage: None,
     };
     assert!(matches!(
@@ -472,8 +663,14 @@ fn session_history_commands_and_context_events_round_trip() {
         tasks: vec![SessionTask {
             request_id: task_request,
             question: "How does run work?".to_owned(),
-            answer: diagram_answer(DiagramKind::Flow),
-            workflow: vec![
+            profile: codeatlas_core::ExplanationProfile::default(),
+            status: codeatlas_core::SessionTaskStatus::Completed,
+            answer: Some(diagram_answer(DiagramKind::Flow)),
+            terminal_error: None,
+            budget_stop_reason: None,
+            started_at_unix_ms: 1_750_000_000_000,
+            finished_at_unix_ms: 1_750_000_001_000,
+            trajectory: vec![
                 WorkflowEvent::Progress(Progress {
                     phase: ProgressPhase::Searching,
                     message: "finding run".to_owned(),
@@ -486,6 +683,9 @@ fn session_history_commands_and_context_events_round_trip() {
                     arguments: serde_json::json!({"query": "run"}),
                 }),
             ],
+            model_calls: Vec::new(),
+            usage: None,
+            budget: None,
         }],
         usage: ModelUsage {
             tokens: TokenUsage::default(),
@@ -512,6 +712,8 @@ fn session_history_commands_and_context_events_round_trip() {
         tasks: vec![SessionTaskSummary {
             request_id: task_request,
             question: "How does run work?".to_owned(),
+            profile: codeatlas_core::ExplanationProfile::default(),
+            status: codeatlas_core::SessionTaskStatus::Completed,
         }],
         created_at_unix_ms: 1_750_000_000_000,
         updated_at_unix_ms: 1_750_000_001_000,

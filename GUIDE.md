@@ -1,15 +1,19 @@
 # CodeAtlas 使用指南
 
-CodeAtlas 是只读的代码库理解 Agent。它索引 Rust、Python 和 Python stub（`.rs`、`.py`、`.pyi`），调用只读查询工具探索代码，并给出带源码证据的回答。
+CodeAtlas 是只读的代码库理解 Agent。它索引 Rust、Python 和 Python stub（`.rs`、`.py`、`.pyi`），调用只读查询工具探索代码，并给出带源码证据的渐进式回答。
+
+完整的环境要求、构建命令、架构、课程 R1-R6 实现状态与提交清单位于 [`README.md`](README.md)。使用前请阅读 [`PRIVACY.md`](PRIVACY.md)：问题、解释 profile、会话回答以及 Agent 按需读取的源码和工具结果会发送给所配置的模型 Provider；该文档也给出了本地历史和凭据的完整删除方法。
 
 ## 1. 启动
 
 ### 课程平台配置
 
+可以从 [`.env.example`](.env.example) 创建本地配置，但 CodeAtlas 不会自动加载 `.env`；需要先在当前 shell 中导出变量，或执行 `set -a; . ./.env; set +a`。不要提交填入真实 Key 的 `.env`。
+
 首次使用时隐藏输入并保存 API Key：
 
 ```bash
-cd /root/CodeAtlas
+cd CodeAtlas
 cargo run -p codeatlas-app --bin codeatlas -- --store-api-key
 ```
 
@@ -18,7 +22,7 @@ Key 默认保存在 `$XDG_CONFIG_HOME/codeatlas/credentials.json`；未设置 `X
 以后启动时不需要再次导出 Key：
 
 ```bash
-cd /root/CodeAtlas
+cd CodeAtlas
 
 export CODEATLAS_ENDPOINT="https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1/chat/completions"
 export CODEATLAS_MODEL="glm-5"
@@ -29,7 +33,7 @@ cargo run -p codeatlas-app --bin codeatlas -- .
 原生 GUI 使用同一套 endpoint、model、超时、重试、data directory 和安全凭据读取逻辑。启动并自动索引当前目录：
 
 ```bash
-cd /root/CodeAtlas
+cd CodeAtlas
 cargo run -p codeatlas-app --bin codeatlas-gui -- .
 ```
 
@@ -57,15 +61,43 @@ GUI 中等待顶部状态变为 `Repository ready`，然后在 Conversation 底�
 
 顶部 `History` 可加载保存的会话，`New session` 在当前 repository 开始新对话。属于其他 repository 的历史会话会明确显示为只读。GUI 不会在索引后自动恢复会话；要继续旧会话，必须先索引该会话对应的 repository，再通过 `History` 手动加载。有 SVG artifact 的回答可在 Diagram decision 中点击 `Open diagram` 调用系统默认查看器。
 
-推荐先问：
+### Guided Progressive Onboarding
+
+UI-neutral core、Agent、session persistence 与 application command 层已经实现 `ExplanationProfile` 和 `SuggestedAction` API。每个 profile 由 audience 与 depth 各一个闭合枚举值组成：
+
+| 维度 | 可选值 | 说明 |
+|---|---|---|
+| Audience | `Beginner`、`Developer`、`Expert` | Beginner 先讲目的、定义高级术语并提供具体例子；Developer 假设具备一般编程能力但不了解当前 repository；Expert 聚焦不变量、权衡、边界情况和实现约束。 |
+| Depth | `Auto`、`Overview`、`Architecture`、`Workflow`、`Code`、`Detail` | Auto 根据问题选择最小充分范围；其余档位依次覆盖全局定位、组件边界、运行流程、代码机制与最深的局部细节。 |
+
+默认值是 `Developer` + `Auto`。profile 只由受信任枚举生成当前 task 的 system control message，不会降低 Evidence 要求。每个终态 task 都把实际 profile 写入 schema 3 session 和 history summary；缺少该字段的旧记录恢复为默认值。
+
+`SuggestedAction` 是闭合且不可执行任意文本的类型，包含 `DeepenClaim`、`ContinueCallPath`、`ExplainEvidence`、`ShowSource` 和 `ChangeDepth`。当前 runtime 在构造最终且通过验证的回答时，确定性地产生最多 4 个不重复 action：首个 Fact（没有 Fact 时为首个 Claim）、未完成的 Call Path（没有时为首个路径）、首个最终保留的 Evidence，以及下一个适用 depth。`ExplainEvidence` 已进入 application contract，但当前自动生成器不会主动选择它。action label 由 runtime 固定，所有被引用的 ID 必须属于该回答；application 也会拒绝执行未成功保存的回答或该回答未曾提供的 action。
+
+需要继续解释的 action 会在同一个 repository session 中转换为新的 `Ask`，复用已有可观察上下文和原 audience；`ChangeDepth` 只替换 depth。`ShowSource` 会直接转换为本地 `LoadSource`，不调用模型，也不增加 Provider Token 或费用。
+
+TUI 在导航状态下按 `g` 打开 profile 设置，用上下键或 `j`/`k` 切换字段、左右键或 `h`/`l` 修改值，按 `Enter` 应用、`Esc` 取消；按 `A` 打开所选回答的建议动作菜单，再用 `j`/`k` 和 `Enter` 执行。GUI 在提问框旁提供紧凑的 Audience/Depth 选择器，并在所选回答下显示最多 4 个动作按钮。加载或切换历史 task 时，两种界面都会恢复该 task 保存的 profile。
+
+### 演示脚本：Overview -> Workflow -> Code/Evidence
+
+在 TUI/GUI 中保持同一 session，先选择 `Beginner` + `Overview`，再依次输入以下问题，并在后两步切换为 `Workflow` 和 `Code`：
 
 ```text
-这个项目主要做什么？请列出核心模块并给出源码证据。
+1. Overview
+这个项目主要做什么？请用概览方式列出核心能力和少量关键模块，并给出源码证据。
 ```
 
 ```text
-从程序入口开始追踪一次请求的主要调用链。
+2. Workflow
+在同一会话中，追踪从用户提问到证据校验完成的运行流程；按顺序说明关键分支，并区分事实、推断和未知。
 ```
+
+```text
+3. Code / Evidence
+继续在同一会话中，下钻到实现这条流程的关键文件、类型和函数，并解释每条源码 Evidence 如何支持结论。
+```
+
+最后执行回答提供的 `ShowSource`，在现有 Evidence 查看器中检查引用源码；这一步只读取本地索引，不产生模型请求。
 
 ## 3. 界面
 
@@ -118,29 +150,29 @@ cargo run -p codeatlas-diagram --example codeatlas_showcase -- ./diagram-showcas
 
 ### Source Evidence
 
-探索工具可能发现很多候选 Evidence，但最终面板和持久化会话只保留被 Claim、CallPath 或 Diagram 实际引用的证据。未引用的探索结果不会堆积在右栏。运行时不会设置“最多显示 N 条”的数量上限，真正被引用的证据不会因列表长度而被静默删除。
+探索工具可能发现很多候选 Evidence，但最终面板和回答对象只保留被 Claim、CallPath 或 Diagram 实际引用的证据。未引用的探索结果不会堆积在右栏；schema 3 的完整 Tool Trace 仍会保存 raw 工具结果。运行时不会设置“最多显示 N 条”的数量上限，真正被引用的证据不会因列表长度而被静默删除。
 
 每条证据显示 `E1`、`E2` 编号、repository-relative path、行号、Symbol，以及引用它的 Claim 标签：`F1` 表示第一个事实，`I1` 表示第一个推断，`U1` 表示第一个未知项。选中证据后，详情区同时显示相关 Claim 文本和源码 excerpt。详情区和全屏查看器都会按文件类型使用终端原生语法高亮；支持 Rust、Python、C/C++、Java、JavaScript、TypeScript、Go、JSON、TOML、YAML、Shell、HTML、CSS 和 SQL，无法识别的类型回退为普通文本。事实引用不存在或证据冲突时，回答会被验证层拒绝。
 
-聚焦 Evidence 后按 `Enter` 或 `v` 打开全屏源码查看器。查看器会从本地索引加载完整证据行段，不受模型工具的 500 行或 64 KiB payload 限制，不调用模型，也不增加 Token。若本地文件在索引后发生变化或无法读取，查看器会保留已有 excerpt 并在面板内提示，不再用全屏错误中断操作。
+聚焦 Evidence 后按 `Enter` 或 `v` 打开全屏源码查看器。查看器会从本地索引加载完整证据行段，不受模型工具的 500 行或 64 KiB payload 限制，不调用模型，也不增加 Token。建议动作中的 `ShowSource` 复用同一条本地 `LoadSource` 边界并打开该查看器。若本地文件在索引后发生变化或无法读取，查看器会保留已有 excerpt 并在面板内提示，不再用全屏错误中断操作。
 
 ### Task History 与续聊
 
-有效回答会先写入内存并通过 `AnswerCompleted` 发布给 UI，随后再 best-effort 保存为 JSON：
+有效回答会写入内存、尝试原子保存为 JSON，并通过 `AnswerCompleted` 发布给 UI。保存失败不会撤销可见回答，但该回答的建议动作不会被授权执行：
 
 ```text
 $CODEATLAS_DATA_DIR/sessions/<session-id>.json
 ```
 
-当前文件使用 session schema 2；已有 schema 1 文件会在读取时迁移，并在下一次成功保存时写回新格式。
+当前文件使用 session schema 3；已有 schema 1 和 2 文件会在读取时安全迁移为已完成任务，并在下一次保存时写回新格式。损坏的单个 JSON 会被报告并跳过，不阻止其他有效会话加载。
 
 重新索引 repository 不会自动恢复历史上下文。需要续聊时，先索引目标 repository，再手动打开 Task History：TUI 在导航状态下按 `h`，GUI 点击顶部 `History`。选择会话后再加载；TUI 使用 `j`/`k` 选择并按 `Enter`，正在输入路径或问题时先按 `Esc` 返回导航状态。
 
-恢复内容包括问题、回答、Claim、最终引用的 Evidence、Call Path、Diagram、Token/Cost，以及按任务保存的 Progress 和 Tool Trace。按 `[` / `]` 切换上一个或下一个任务，Repository 面板只显示当前任务的探索流程，Conversation 仍保留整段多轮对话。
+恢复内容包括任务终态（completed、failed、cancelled、budget exceeded）、每个 task 的 `ExplanationProfile`、问题、可选回答或终止错误、时间戳、Claim、Evidence、Call Path、Diagram、`SuggestedAction`、Token/Cost、每次模型调用及重试、Budget、Progress 和完整 Tool Trace。按 `[` / `]` 切换任务，Repository 面板显示所选任务的探索流程、模型 ledger 和预算。
 
 其他 repository 的会话可以只读查看；只有先索引与会话匹配的 repository，再通过 History 手动加载该会话，才能继续提问或从本地加载完整源码。
 
-历史工作流用于审计 Agent 实际执行的阶段、工具参数和结果摘要，不包含模型私有思维链。完整 canonical ToolOutput 和未引用候选源码仍只在当前请求期间存在；JSON 中只保存有界结果摘要和最终回答真正引用的 Evidence。
+schema 3 历史用于完整本地审计与续聊：保存每个 task 的 profile、传入 `ModelClient` 的 provider-neutral 请求、解析归一化后的响应/assistant 输出、重试错误、Progress、Usage 与 Budget 事件。`ToolCallCompleted` 保存工具执行器返回的完整 raw JSON（包括未引用候选源码），不做源码字段脱敏或 1000 字符截断；另存的 system-free 续聊消息是送入模型对话的版本，其中 Evidence 去重和发送窗口整理可能使 tool message 比 raw ToolOutput 更紧凑。这里不保存 HTTP wire bytes、响应中未解析的 Provider 私有字段或认证 header，也不会创建或保存模型私有思维链。请把 sessions 目录视为敏感源码副本。
 
 终端较窄时界面自动切换为单面板 Tabs；终端过小时只显示精简状态。
 
@@ -152,6 +184,8 @@ $CODEATLAS_DATA_DIR/sessions/<session-id>.json
 |---|---|
 | `i` | 输入或更换 repository 路径 |
 | `a` 或 `?` | 输入问题 |
+| `g` | 打开 Explanation Profile 设置 |
+| `A` | 打开所选回答的 Suggested Actions 菜单 |
 | `h` | 打开或刷新 Task History；历史页中再次按下可关闭 |
 | `[` / `]` | 切换上一个 / 下一个任务及其工作流 |
 | `n` / `p` | Repository 面板中选择下一个 / 上一个工具调用 |
@@ -203,6 +237,8 @@ $CODEATLAS_DATA_DIR/sessions/<session-id>.json
 
 | 环境变量 | 默认值 | 用途 |
 |---|---:|---|
+| `CODEATLAS_REASONING_MODE` | 未设置 | 原样发送给 Provider 的可选 reasoning mode；仅在 Provider 支持时设置 |
+| `CODEATLAS_REASONING_EFFORT` | 未设置 | 原样发送给 Provider 的可选 reasoning effort；仅在 Provider 支持时设置 |
 | `CODEATLAS_MODEL_TIMEOUT_SECONDS` | `180` | 单次模型 HTTP 请求超时 |
 | `CODEATLAS_AGENT_TIMEOUT_SECONDS` | `1200` | 一次完整多轮问答的总超时；包含探索、重试和答案修复 |
 | `CODEATLAS_MODEL_MAX_RETRIES` | `2` | transport、timeout、HTTP 429 及其他临时模型错误的重试次数 |
@@ -210,7 +246,15 @@ $CODEATLAS_DATA_DIR/sessions/<session-id>.json
 | `CODEATLAS_MAX_OUTPUT_TOKENS` | Provider 默认 | 最大输出 Token |
 | `CODEATLAS_CONTEXT_WINDOW_TOKENS` | 未设置 | 模型上下文窗口；设置后会在发送前主动整理过长历史和旧工具结果 |
 | `CODEATLAS_TEMPERATURE` | Provider 默认 | 采样温度 |
-| `CODEATLAS_DATA_DIR` | `$XDG_DATA_HOME/codeatlas` 或 `~/.local/share/codeatlas` | 外部缓存和会话目录 |
+| `CODEATLAS_PRICING_CURRENCY` | `USD` | 显式价格和金额预算的币种标签 |
+| `CODEATLAS_INPUT_PRICE_PER_MILLION` | 未设置 | 每百万 uncached input Token 价格；必须与 output 价格同时设置 |
+| `CODEATLAS_CACHED_INPUT_PRICE_PER_MILLION` | input 价格 | 可选的每百万 cached input Token 价格 |
+| `CODEATLAS_OUTPUT_PRICE_PER_MILLION` | 未设置 | 每百万 output Token 价格；必须与 input 价格同时设置 |
+| `CODEATLAS_AGENT_MAX_TOTAL_TOKENS` | 未设置 | 每个问答的累计 reported Token 上限 |
+| `CODEATLAS_AGENT_MAX_COST` | 未设置 | 每个问答的估算金额上限；必须先配置 input/output 价格 |
+| `CODEATLAS_DATA_DIR` | `$XDG_DATA_HOME/codeatlas`、`~/.local/share/codeatlas`，或无 HOME 时系统临时目录中的 `codeatlas-<pid>` | 外部缓存和会话目录 |
+
+Reasoning 字段是 Provider-specific 的透传设置，CodeAtlas 不解析或展示模型私有思维链。价格完全由用户提供，不是 Provider 账单；per-call ledger、重试结果与预算状态同时显示并写入 schema 3 history。Token/金额预算在每次 Provider 返回 usage 后检查，因此超出量最多可达到最后一次调用的用量；Provider 不返回 usage 时会停止任务并记录预算不可执行。
 
 慢速模型示例：
 
@@ -224,7 +268,7 @@ export CODEATLAS_CONTEXT_WINDOW_TOKENS="128000"
 
 ## 6. Token 效率
 
-CodeAtlas 在一次请求期间保留完整 canonical ToolOutput 和候选 Evidence，但最终回答、会话和 Evidence 面板只保留被结构化回答引用的 Evidence。持久化工作流仅保留 Progress、Tool 参数和最多约 1000 字符的结果摘要，不重新保存完整候选源码。发送给模型的上下文遵循以下规则：
+CodeAtlas 在 schema 3 会话的 `ToolCallCompleted` 中完整保留 raw ToolOutput 和候选 Evidence，并保存 provider-neutral 模型/工具轨迹；Evidence 面板仍只展示结构化回答实际引用的 Evidence。raw 工具结果与续聊/发送消息是两个边界：后者可做 Evidence 去重或按窗口整理，但不会改写前者。发送规则如下：
 
 - 保留 `false`、`null`、完整性标记和工具错误详情，不通过删除有语义字段节省 Token；
 - data 已包含 Evidence excerpt 时不重复发送同一份源码；
@@ -235,7 +279,7 @@ CodeAtlas 在一次请求期间保留完整 canonical ToolOutput 和候选 Evide
 - Provider 明确返回 context overflow 时会进一步整理上下文并重试；普通 5xx、429、transport timeout 重试不会修改工具上下文；
 - 不使用 LLM 摘要替换源码，不牺牲 Evidence 校验换取 Token 节省。
 
-CodeAtlas 不设置探索轮数、工具调用次数或累计 Token 硬上限；探索持续到提交有效答案、用户取消或总 deadline 到达。Provider 自身的上下文窗口、账户额度和单次响应限制仍然有效；`CODEATLAS_MAX_OUTPUT_TOKENS` 只有显式设置时才会限制单次输出。
+默认情况下 CodeAtlas 不设置探索轮数、工具调用次数或累计 Token/金额上限；探索持续到提交有效答案、用户取消或总 deadline 到达。可以用 `CODEATLAS_AGENT_MAX_TOTAL_TOKENS` 设置每个问答的累计 reported Token 上限，或在提供显式价格后用 `CODEATLAS_AGENT_MAX_COST` 设置估算金额上限，但仍没有工具调用次数硬上限。Provider 自身的上下文窗口、账户额度和单次响应限制仍然有效；`CODEATLAS_MAX_OUTPUT_TOKENS` 只有显式设置时才会限制单次输出。
 
 ## 7. 排障
 
@@ -296,4 +340,4 @@ chmod 600 ~/.config/codeatlas/credentials.json
 - SVG 只写入外部 data directory；文件名只使用稳定 ID，模型文本经过 XML 转义。
 - 查询工具只能读取已索引内容，没有 shell、写文件或自动修复能力。
 - 调用图是保守的静态近似；动态派发、反射、宏生成和运行时注册可能无法完整解析。
-- 当前模型请求为非流式 Chat Completions；TUI 在完成后显示完整回答和中间工具事件。有效答案在写入内存后立即发布，session 磁盘保存失败只显示可恢复诊断，不会撤销回答。
+- 当前模型请求为非流式 Chat Completions；TUI 在完成后显示完整回答和中间工具事件。有效答案会在 session 保存尝试完成后发布；磁盘保存失败只显示可恢复诊断，不会撤销回答，但会禁用该未落盘回答的建议动作。

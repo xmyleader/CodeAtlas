@@ -3,6 +3,8 @@ use thiserror::Error;
 /// A diagnostic failure produced while building or querying a repository index.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum QueryError {
+    #[error("repository query was cancelled")]
+    Cancelled,
     #[error("invalid repository model: {message}")]
     InvalidModel { message: String },
     #[error("invalid query: {message}")]

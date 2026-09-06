@@ -13,8 +13,8 @@ use codeatlas_core::{
     SymbolKind, TargetResolution,
 };
 use codeatlas_indexer::{
-    CachedIndex, IndexAssembler, Indexer, JsonIndexStore, ParserRegistry, RepositoryScanner,
-    RepositorySpec, ScanConfig,
+    CachedIndex, IndexAssembler, IndexError, IndexStoreError, Indexer, JsonIndexStore,
+    ParserRegistry, RepositoryScanner, RepositorySpec, ScanConfig,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -287,6 +287,138 @@ fn cache_store_rejects_an_invalid_core_schema() {
             .write(&spec.repository_id().to_string(), &cached)
             .is_err()
     );
+}
+
+#[test]
+fn indexing_cancels_after_parse_without_writing_cache() {
+    let repository = TestDirectory::new("cancel-repository");
+    let cache = TestDirectory::new("cancel-cache");
+    repository.write("a.rs", "fn a() {}\n");
+    repository.write("b.rs", "fn b() {}\n");
+    let parser_calls = Arc::new(AtomicUsize::new(0));
+    let indexer = Indexer::new(ScanConfig::default(), registry(parser_calls.clone()))
+        .with_store(JsonIndexStore::new(cache.path()));
+    let cancellation = || parser_calls.load(Ordering::Relaxed) >= 1;
+
+    let error = indexer
+        .index_cancellable(
+            repository.path(),
+            RepositorySpec::new("fixture", "cancel-index"),
+            None,
+            Some(&cancellation),
+        )
+        .expect_err("index should observe cancellation after the first parse");
+
+    assert!(matches!(error, IndexError::Cancelled));
+    assert_eq!(parser_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        fs::read_dir(cache.path()).expect("cache directory").count(),
+        0
+    );
+}
+
+#[test]
+fn cancelled_cache_serialization_does_not_publish_a_partial_entry() {
+    let cache = TestDirectory::new("cancel-cache-write");
+    let store = JsonIndexStore::new(cache.path());
+    let spec = RepositorySpec::new("fixture", "cancel-cache-write");
+    let cached = CachedIndex {
+        fingerprint: "fingerprint".to_owned(),
+        model: IndexAssembler::new(spec.clone())
+            .assemble(Vec::new())
+            .expect("empty model should assemble"),
+        parsed_files: 0,
+        skipped_files: 0,
+        diagnostics: Vec::new(),
+    };
+    let checks = AtomicUsize::new(0);
+    let cancellation = || checks.fetch_add(1, Ordering::Relaxed) >= 2;
+
+    let error = store
+        .write_cancellable(
+            &spec.repository_id().to_string(),
+            &cached,
+            Some(&cancellation),
+        )
+        .expect_err("cache serialization should observe cancellation");
+
+    assert!(matches!(error, IndexStoreError::Cancelled));
+    assert_eq!(
+        fs::read_dir(cache.path()).expect("cache directory").count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_store_uses_private_permissions_and_rejects_symlink_directory() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let root = TestDirectory::new("cache-safety");
+    let cache = root.path().join("cache");
+    let store = JsonIndexStore::new(&cache);
+    let spec = RepositorySpec::new("fixture", "safe-cache");
+    let cached = CachedIndex {
+        fingerprint: "fingerprint".to_owned(),
+        model: IndexAssembler::new(spec.clone())
+            .assemble(Vec::new())
+            .expect("empty model should assemble"),
+        parsed_files: 0,
+        skipped_files: 0,
+        diagnostics: Vec::new(),
+    };
+    store
+        .write(&spec.repository_id().to_string(), &cached)
+        .expect("cache should save");
+    assert_eq!(
+        fs::metadata(&cache)
+            .expect("cache metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let entry = fs::read_dir(&cache)
+        .expect("cache directory")
+        .next()
+        .expect("cache entry")
+        .expect("read cache entry")
+        .path();
+    assert_eq!(
+        fs::metadata(&entry)
+            .expect("entry metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let escaped_file = root.path().join("escaped-cache.json");
+    fs::write(&escaped_file, b"do not replace").expect("escaped file fixture");
+    fs::remove_file(&entry).expect("cache entry should be removable");
+    symlink(&escaped_file, &entry).expect("cache entry symlink");
+    assert!(matches!(
+        store.read(&spec.repository_id().to_string()),
+        Err(IndexStoreError::UnsafeStoragePath { .. })
+    ));
+    assert!(matches!(
+        store.write(&spec.repository_id().to_string(), &cached),
+        Err(IndexStoreError::UnsafeStoragePath { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(&escaped_file).expect("escaped file should remain readable"),
+        "do not replace"
+    );
+
+    let escaped = root.path().join("escaped");
+    let linked = root.path().join("linked");
+    fs::create_dir(&escaped).expect("escaped directory");
+    symlink(&escaped, &linked).expect("cache directory symlink");
+    let error = JsonIndexStore::new(linked)
+        .write(&spec.repository_id().to_string(), &cached)
+        .expect_err("symlinked cache directory must be rejected");
+    assert!(matches!(error, IndexStoreError::UnsafeStoragePath { .. }));
+    assert_eq!(fs::read_dir(escaped).expect("escaped directory").count(), 0);
 }
 
 fn parsed_with_local_call(

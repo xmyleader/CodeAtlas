@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentAnswer, DiagramId, EntryPointKind, Evidence, Language, ModelUsage, RepositoryId,
-    RepositoryPath, RequestId, SessionContext, SessionId, SessionSummary, ToolCall, ToolOutput,
+    AgentAnswer, AnswerId, BudgetStopReason, DiagramId, EntryPointKind, Evidence,
+    ExplanationProfile, Language, ModelBudgetStatus, ModelCallRecord, ModelUsage, RepositoryId,
+    RepositoryPath, RequestId, SessionContext, SessionId, SessionSummary, SuggestedAction,
+    ToolCall, ToolOutput, WorkflowEvent,
 };
 
 /// Commands accepted by a UI-independent `CodeAtlas` application runtime.
@@ -19,6 +21,16 @@ pub enum AppCommand {
         session_id: SessionId,
         repository_id: RepositoryId,
         question: String,
+        #[serde(default)]
+        profile: ExplanationProfile,
+    },
+    /// Executes only an action previously offered on a persisted answer.
+    RunSuggestedAction {
+        request_id: RequestId,
+        session_id: SessionId,
+        repository_id: RepositoryId,
+        answer_id: AnswerId,
+        action: SuggestedAction,
     },
     LoadSource {
         request_id: RequestId,
@@ -142,6 +154,23 @@ pub enum AppEvent {
     UsageUpdated {
         request_id: RequestId,
         usage: ModelUsage,
+    },
+    ModelCallRecorded {
+        request_id: RequestId,
+        record: ModelCallRecord,
+    },
+    BudgetUpdated {
+        request_id: RequestId,
+        status: ModelBudgetStatus,
+    },
+    BudgetExceeded {
+        request_id: RequestId,
+        status: ModelBudgetStatus,
+        reason: BudgetStopReason,
+    },
+    TaskTraceRecorded {
+        request_id: RequestId,
+        event: WorkflowEvent,
     },
     IndexCompleted {
         request_id: RequestId,

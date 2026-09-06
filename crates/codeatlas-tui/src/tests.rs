@@ -3,11 +3,13 @@ use std::sync::mpsc;
 use codeatlas_core::{
     AgentAnswer, AnswerId, AppCommand, AppError, AppEvent, CallPath, CallPathId, CallPathStep,
     Claim, ClaimId, ClaimKind, Cost, Diagram, DiagramArtifact, DiagramDecision, DiagramEdge,
-    DiagramId, DiagramKind, DiagramNode, EntryPointKind, Evidence, EvidenceId, FileId, Language,
-    ModelUsage, Progress, ProgressPhase, RepositoryEntryPoint, RepositoryId, RepositoryLanguage,
-    RepositoryMap, RepositoryModule, RepositoryPath, RequestId, SessionContext, SessionId,
-    SessionSummary, SessionTask, SessionTaskSummary, SourceSpan, SymbolId, TargetResolution,
-    TokenUsage, ToolCall, ToolCallId, ToolOutput, WorkflowEvent,
+    DiagramId, DiagramKind, DiagramNode, EntryPointKind, Evidence, EvidenceId, ExplanationAudience,
+    ExplanationDepth, ExplanationProfile, FileId, Language, ModelBudget, ModelBudgetStatus,
+    ModelCallId, ModelCallOutcome, ModelCallRecord, ModelUsage, Progress, ProgressPhase,
+    RepositoryEntryPoint, RepositoryId, RepositoryLanguage, RepositoryMap, RepositoryModule,
+    RepositoryPath, RequestId, SessionContext, SessionId, SessionSummary, SessionTask,
+    SessionTaskSummary, SourceSpan, SuggestedAction, SymbolId, TargetResolution, TokenUsage,
+    ToolCall, ToolCallId, ToolOutput, WorkflowEvent,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Color};
@@ -17,6 +19,53 @@ use crate::{
     Activity, ApplicationPort, ChannelApplicationPort, ConversationEntry, EvidenceViewer,
     InputMode, LayoutMode, Panel, ToolTraceStatus, TuiApp, UiPreferences, terminal::encode_base64,
 };
+
+#[test]
+fn reducer_keeps_model_call_ledger_and_budget_status() {
+    let mut app = TuiApp::new("model-cost-controls");
+    let request_id = RequestId::from_stable_parts(&["model-cost-controls"]);
+    let usage = TokenUsage {
+        input_tokens: 8,
+        output_tokens: 2,
+        cached_input_tokens: 3,
+        total_tokens: 10,
+    };
+    app.reduce(AppEvent::ModelCallRecorded {
+        request_id,
+        record: ModelCallRecord {
+            id: ModelCallId::from_stable_parts(&["model-cost-controls", "1"]),
+            sequence: 1,
+            model: "test-model".to_owned(),
+            outcome: ModelCallOutcome::Succeeded,
+            usage: Some(usage),
+            cost: None,
+        },
+    });
+    app.reduce(AppEvent::BudgetUpdated {
+        request_id,
+        status: ModelBudgetStatus {
+            budget: ModelBudget {
+                max_total_tokens: Some(100),
+                max_cost: None,
+            },
+            usage: ModelUsage {
+                tokens: usage,
+                cost: None,
+            },
+        },
+    });
+
+    assert_eq!(app.selected_model_calls().count(), 1);
+    assert_eq!(
+        app.selected_budget()
+            .and_then(|status| status.budget.max_total_tokens),
+        Some(100)
+    );
+    let rendered = rendered_text(&mut app, 140, 80);
+    assert!(rendered.contains("MODEL CALLS"));
+    assert!(rendered.contains("test-model"));
+    assert!(rendered.contains("Budget: tokens 10/100"));
+}
 
 fn id_request(label: &str) -> RequestId {
     RequestId::from_stable_parts(&["test", label])
@@ -32,6 +81,11 @@ fn type_text(app: &mut TuiApp, text: &str) {
     }
 }
 
+fn complete_answer(app: &mut TuiApp, request_id: RequestId, answer: AgentAnswer) {
+    app.expect_answer_for_test(request_id);
+    app.reduce(AppEvent::AnswerCompleted { request_id, answer });
+}
+
 fn sample_evidence(label: &str, path: &str, start: u32) -> Evidence {
     Evidence {
         id: EvidenceId::from_stable_parts(&[label]),
@@ -45,9 +99,10 @@ fn sample_evidence(label: &str, path: &str, start: u32) -> Evidence {
 
 fn add_evidence(app: &mut TuiApp, evidence: Evidence) {
     let key = evidence.id.to_string();
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: RequestId::from_stable_parts(&["test", "evidence", &key]),
-        answer: AgentAnswer {
+    complete_answer(
+        app,
+        RequestId::from_stable_parts(&["test", "evidence", &key]),
+        AgentAnswer {
             id: AnswerId::from_stable_parts(&["test", "evidence-answer", &key]),
             text: "Evidence fixture".to_owned(),
             claims: vec![Claim {
@@ -61,9 +116,10 @@ fn add_evidence(app: &mut TuiApp, evidence: Evidence) {
             diagram: DiagramDecision::NotNeeded {
                 reason: "A fixture does not need a diagram.".to_owned(),
             },
+            suggested_actions: Vec::new(),
             usage: None,
         },
-    });
+    );
 }
 
 fn sample_answer(evidence: &Evidence) -> AgentAnswer {
@@ -108,6 +164,7 @@ fn sample_answer(evidence: &Evidence) -> AgentAnswer {
         diagram: DiagramDecision::NotNeeded {
             reason: "The answer is direct enough without a diagram.".to_owned(),
         },
+        suggested_actions: Vec::new(),
         usage: Some(ModelUsage {
             tokens: TokenUsage {
                 input_tokens: 800,
@@ -122,6 +179,149 @@ fn sample_answer(evidence: &Evidence) -> AgentAnswer {
             }),
         }),
     }
+}
+
+#[test]
+fn profile_defaults_modal_navigation_and_ask_payload_are_consistent() {
+    let mut app = TuiApp::new("profile-settings");
+    assert_eq!(app.profile(), ExplanationProfile::default());
+    assert_eq!(app.profile().audience, ExplanationAudience::Developer);
+    assert_eq!(app.profile().depth, ExplanationDepth::Auto);
+
+    let _ = app.handle_key(key(KeyCode::Esc));
+    let _ = app.handle_key(key(KeyCode::Char('g')));
+    assert!(app.profile_settings().is_some());
+    let compact = rendered_text(&mut app, 23, 7);
+    assert!(compact.contains("Explanation Profile"));
+    assert!(compact.contains("Audience"));
+    assert!(compact.contains("Depth"));
+
+    let _ = app.handle_key(key(KeyCode::Right));
+    let _ = app.handle_key(key(KeyCode::Tab));
+    let _ = app.handle_key(key(KeyCode::Right));
+    let _ = app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.profile(), ExplanationProfile::default());
+
+    let _ = app.handle_key(key(KeyCode::Char('g')));
+    let _ = app.handle_key(key(KeyCode::Right));
+    let _ = app.handle_key(key(KeyCode::Char('j')));
+    let _ = app.handle_key(key(KeyCode::Right));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let expected = ExplanationProfile::new(ExplanationAudience::Expert, ExplanationDepth::Overview);
+    assert_eq!(app.profile(), expected);
+    assert!(app.profile_settings().is_none());
+
+    complete_index(&mut app, "/profile-repo");
+    app.set_question("Explain the request path");
+    let AppCommand::Ask { profile, .. } = app.submit_question().expect("ask command") else {
+        panic!("expected ask command");
+    };
+    assert_eq!(profile, expected);
+
+    let _ = app.handle_key(key(KeyCode::Char('g')));
+    assert!(app.profile_settings().is_none());
+    assert_eq!(app.error().map(|error| error.code.as_str()), Some("busy"));
+    assert_eq!(app.activity(), Activity::AskQueued);
+}
+
+#[test]
+fn suggested_action_menu_executes_exact_context_and_show_source_uses_viewer() {
+    let mut app = TuiApp::new("suggested-actions");
+    let repository_id = complete_index(&mut app, "/actions-repo");
+    let request_id = id_request("suggested-answer-request");
+    let evidence = sample_evidence("suggested-source", "src/suggested.rs", 14);
+    let mut answer = sample_answer(&evidence);
+    let answer_id = answer.id;
+    let deepen = SuggestedAction::DeepenClaim {
+        claim_id: answer.claims[0].id,
+    };
+    let show_source = SuggestedAction::ShowSource {
+        evidence_id: evidence.id,
+    };
+    answer.suggested_actions = vec![
+        deepen,
+        show_source,
+        SuggestedAction::ContinueCallPath {
+            call_path_id: answer.call_paths[0].id,
+        },
+        SuggestedAction::ChangeDepth {
+            depth: ExplanationDepth::Detail,
+        },
+    ];
+    complete_answer(&mut app, request_id, answer);
+
+    let rendered = rendered_text(&mut app, 140, 40);
+    assert!(rendered.contains("[A] SUGGESTED ACTIONS"));
+    assert!(rendered.contains(deepen.label()));
+    assert!(rendered.contains(show_source.label()));
+
+    let conversation_entries = app.conversation().len();
+    let _ = app.handle_key(key(KeyCode::Char('A')));
+    assert_eq!(
+        app.suggested_action_menu().map(|menu| menu.actions().len()),
+        Some(4)
+    );
+    let compact_menu = rendered_text(&mut app, 23, 7);
+    assert!(compact_menu.contains("Suggested Actions"));
+    let _ = app.handle_key(key(KeyCode::Char('j')));
+    let source_command = app
+        .handle_key(key(KeyCode::Enter))
+        .expect("source action command");
+    let source_request = match source_command {
+        AppCommand::RunSuggestedAction {
+            request_id: action_request,
+            session_id,
+            repository_id: action_repository,
+            answer_id: action_answer,
+            action,
+        } => {
+            assert_eq!(session_id, app.session_id());
+            assert_eq!(action_repository, repository_id);
+            assert_eq!(action_answer, answer_id);
+            assert_eq!(action, show_source);
+            action_request
+        }
+        _ => panic!("expected suggested action command"),
+    };
+    assert_eq!(app.conversation().len(), conversation_entries);
+    assert!(app.evidence_viewer().is_some_and(EvidenceViewer::loading));
+
+    app.reduce(AppEvent::SourceLoaded {
+        request_id: source_request,
+        repository_id,
+        path: evidence.path.clone(),
+        start_line: 14,
+        end_line: 16,
+        content: "loaded suggested source".to_owned(),
+    });
+    assert_eq!(
+        app.evidence_viewer().map(EvidenceViewer::content),
+        Some("loaded suggested source")
+    );
+    assert_eq!(app.conversation().len(), conversation_entries);
+
+    let _ = app.handle_key(key(KeyCode::Esc));
+    let _ = app.handle_key(key(KeyCode::Char('A')));
+    let follow_up = app
+        .handle_key(key(KeyCode::Enter))
+        .expect("follow-up action command");
+    match follow_up {
+        AppCommand::RunSuggestedAction {
+            session_id,
+            repository_id: action_repository,
+            answer_id: action_answer,
+            action,
+            ..
+        } => {
+            assert_eq!(session_id, app.session_id());
+            assert_eq!(action_repository, repository_id);
+            assert_eq!(action_answer, answer_id);
+            assert_eq!(action, deepen);
+        }
+        _ => panic!("expected suggested action command"),
+    }
+    assert_eq!(app.conversation().len(), conversation_entries + 1);
+    assert_eq!(app.activity(), Activity::AskQueued);
 }
 
 fn sample_needed_diagram(
@@ -246,6 +446,7 @@ fn complete_index(app: &mut TuiApp, path: &str) -> RepositoryId {
     let request_id = match command {
         AppCommand::Index { request_id, .. } => request_id,
         AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
@@ -428,10 +629,7 @@ fn long_wrapped_conversation_scrolls_to_its_last_line_and_back_home() {
     answer.diagram = DiagramDecision::NotNeeded {
         reason: "CONVERSATION_FINAL_MARKER".to_owned(),
     };
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: id_request("wrapped-conversation-scroll"),
-        answer,
-    });
+    complete_answer(&mut app, id_request("wrapped-conversation-scroll"), answer);
     let _ = app.handle_key(key(KeyCode::Esc));
     let _ = app.handle_key(key(KeyCode::Char('2')));
 
@@ -484,6 +682,7 @@ fn answer_completion_preserves_manual_scroll_and_tail_following_can_resume() {
     let mut answer_lines = vec!["MANUAL_SCROLL_TOP_MARKER".to_owned()];
     answer_lines.extend((0..60).map(|line| format!("row {line:02} {WORD_A} {WORD_B}")));
     let answer_text = answer_lines.join("\n");
+    app.expect_answer_for_test(request_id);
     app.reduce(AppEvent::AnswerDelta {
         request_id,
         delta: answer_text.clone(),
@@ -496,9 +695,10 @@ fn answer_completion_preserves_manual_scroll_and_tail_following_can_resume() {
     assert!(top.contains("MANUAL_SCROLL_TOP_MARKER"));
     assert!(!app.conversation_follows_tail());
 
-    app.reduce(AppEvent::AnswerCompleted {
+    complete_answer(
+        &mut app,
         request_id,
-        answer: AgentAnswer {
+        AgentAnswer {
             id: AnswerId::from_stable_parts(&["manual-conversation-scroll"]),
             text: answer_text,
             claims: Vec::new(),
@@ -507,9 +707,10 @@ fn answer_completion_preserves_manual_scroll_and_tail_following_can_resume() {
             diagram: DiagramDecision::NotNeeded {
                 reason: "COMPLETED_TAIL_MARKER".to_owned(),
             },
+            suggested_actions: Vec::new(),
             usage: None,
         },
-    });
+    );
 
     assert!(!app.conversation_follows_tail());
     let held = rendered_text(&mut app, 64, 18);
@@ -525,8 +726,10 @@ fn answer_completion_preserves_manual_scroll_and_tail_following_can_resume() {
     let _ = app.handle_key(key(KeyCode::Down));
     let _ = app.handle_key(key(KeyCode::PageDown));
     assert!(app.conversation_follows_tail());
+    let resumed_request_id = id_request("resumed-conversation-tail");
+    app.expect_answer_for_test(resumed_request_id);
     app.reduce(AppEvent::AnswerDelta {
-        request_id: id_request("resumed-conversation-tail"),
+        request_id: resumed_request_id,
         delta: "NEW_STREAM_TAIL_MARKER".to_owned(),
     });
     let resumed = rendered_text(&mut app, 64, 18);
@@ -584,10 +787,7 @@ fn repository_scroll_reaches_call_paths_with_tools_present() {
             }
         })
         .collect();
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: answer_request,
-        answer,
-    });
+    complete_answer(&mut app, answer_request, answer);
     let _ = app.handle_key(key(KeyCode::Esc));
 
     assert_eq!(app.selected_tool_index(), Some(0));
@@ -699,6 +899,7 @@ fn opening_evidence_loads_its_inclusive_line_range_without_becoming_active() {
         }
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -741,6 +942,7 @@ fn source_reducer_ignores_stale_results_and_replaces_excerpt_with_matching_load(
         } => (request_id, path),
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -818,6 +1020,7 @@ fn source_load_errors_remain_inline_and_keep_the_evidence_excerpt() {
         AppCommand::LoadSource { request_id, .. } => request_id,
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -851,6 +1054,7 @@ fn source_load_errors_remain_inline_and_keep_the_evidence_excerpt() {
         AppCommand::LoadSource { request_id, .. } => request_id,
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -959,6 +1163,7 @@ fn evidence_viewer_n_and_p_switch_selection_and_issue_fresh_loads() {
         }
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -979,6 +1184,7 @@ fn evidence_viewer_n_and_p_switch_selection_and_issue_fresh_loads() {
         }
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -1019,6 +1225,7 @@ fn evidence_viewer_n_and_p_switch_selection_and_issue_fresh_loads() {
         }
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -1085,6 +1292,7 @@ fn evidence_viewer_copy_requests_exact_source_and_escape_closes_it() {
         AppCommand::LoadSource { request_id, .. } => request_id,
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -1141,6 +1349,7 @@ fn evidence_viewer_renders_at_tiny_sizes_and_error_details_take_priority() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn keyboard_state_machine_indexes_asks_selects_cancels_and_quits() {
     let mut app = TuiApp::new("keyboard");
     assert_eq!(app.input_mode(), InputMode::RepositoryPath);
@@ -1157,6 +1366,7 @@ fn keyboard_state_machine_indexes_asks_selects_cancels_and_quits() {
             request_id
         }
         AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
@@ -1189,13 +1399,16 @@ fn keyboard_state_machine_indexes_asks_selects_cancels_and_quits() {
             session_id,
             repository_id: command_repository,
             question,
+            profile,
         } => {
             assert_eq!(session_id, app.session_id());
             assert_eq!(command_repository, repository_id);
             assert_eq!(question, "How does routing work?");
+            assert_eq!(profile, ExplanationProfile::default());
             request_id
         }
         AppCommand::Index { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
@@ -1230,6 +1443,7 @@ fn keyboard_state_machine_indexes_asks_selects_cancels_and_quits() {
         }
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::ListSessions { .. }
         | AppCommand::LoadSession { .. }
@@ -1262,6 +1476,7 @@ fn generated_request_and_repository_session_ids_are_fresh() {
     let first_request = match first_command {
         AppCommand::Index { request_id, .. } => request_id,
         AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
@@ -1318,6 +1533,7 @@ fn generated_request_and_repository_session_ids_are_fresh() {
     let ask_request = match ask {
         AppCommand::Ask { request_id, .. } => request_id,
         AppCommand::Index { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
@@ -1350,6 +1566,7 @@ fn history_load_restores_complete_context_and_scopes_workflow_by_task() {
         }
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::LoadSession { .. }
@@ -1371,10 +1588,20 @@ fn history_load_restores_complete_context_and_scopes_workflow_by_task() {
                 SessionTaskSummary {
                     request_id: first_request,
                     question: "FIRST_HISTORY_QUESTION".to_owned(),
+                    profile: ExplanationProfile::new(
+                        ExplanationAudience::Beginner,
+                        ExplanationDepth::Overview,
+                    ),
+                    status: codeatlas_core::SessionTaskStatus::Completed,
                 },
                 SessionTaskSummary {
                     request_id: second_request,
                     question: "SECOND_HISTORY_QUESTION".to_owned(),
+                    profile: ExplanationProfile::new(
+                        ExplanationAudience::Expert,
+                        ExplanationDepth::Code,
+                    ),
+                    status: codeatlas_core::SessionTaskStatus::BudgetExceeded,
                 },
             ],
             json_path: json_path.to_owned(),
@@ -1385,6 +1612,7 @@ fn history_load_restores_complete_context_and_scopes_workflow_by_task() {
     assert!(history.contains("FIRST_HISTORY_QUESTION"));
     assert!(!history.contains("SECOND_HISTORY_QUESTION"));
     assert!(history.contains("2 tasks"));
+    assert!(history.contains("[budget]"));
     assert!(history.contains("updated unix:1700000123s"));
     assert!(history.contains(json_path));
 
@@ -1401,6 +1629,7 @@ fn history_load_restores_complete_context_and_scopes_workflow_by_task() {
         }
         AppCommand::Index { .. }
         | AppCommand::Ask { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
@@ -1447,24 +1676,57 @@ fn history_load_restores_complete_context_and_scopes_workflow_by_task() {
                 SessionTask {
                     request_id: first_request,
                     question: "FIRST_HISTORY_QUESTION".to_owned(),
-                    answer: first_answer,
-                    workflow: workflow(
+                    profile: ExplanationProfile::new(
+                        ExplanationAudience::Beginner,
+                        ExplanationDepth::Overview,
+                    ),
+                    status: codeatlas_core::SessionTaskStatus::Completed,
+                    answer: Some(first_answer),
+                    terminal_error: None,
+                    budget_stop_reason: None,
+                    started_at_unix_ms: 1,
+                    finished_at_unix_ms: 2,
+                    trajectory: workflow(
                         ProgressPhase::Searching,
                         "FIRST_HISTORY_PROGRESS",
                         first_tool,
                         "FIRST_HISTORY_TOOL",
                     ),
+                    model_calls: Vec::new(),
+                    usage: None,
+                    budget: Some(ModelBudgetStatus {
+                        budget: ModelBudget {
+                            max_total_tokens: Some(100),
+                            max_cost: None,
+                        },
+                        usage: ModelUsage {
+                            tokens: TokenUsage::default(),
+                            cost: None,
+                        },
+                    }),
                 },
                 SessionTask {
                     request_id: second_request,
                     question: "SECOND_HISTORY_QUESTION".to_owned(),
-                    answer: second_answer,
-                    workflow: workflow(
+                    profile: ExplanationProfile::new(
+                        ExplanationAudience::Expert,
+                        ExplanationDepth::Code,
+                    ),
+                    status: codeatlas_core::SessionTaskStatus::Completed,
+                    answer: Some(second_answer),
+                    terminal_error: None,
+                    budget_stop_reason: None,
+                    started_at_unix_ms: 1,
+                    finished_at_unix_ms: 2,
+                    trajectory: workflow(
                         ProgressPhase::Tracing,
                         "SECOND_HISTORY_PROGRESS",
                         second_tool,
                         "SECOND_HISTORY_TOOL",
                     ),
+                    model_calls: Vec::new(),
+                    usage: None,
+                    budget: None,
                 },
             ],
             usage: ModelUsage {
@@ -1489,6 +1751,11 @@ fn history_load_restores_complete_context_and_scopes_workflow_by_task() {
     assert_eq!(app.session_repository_id(), Some(repository_id));
     assert_eq!(app.session_json_path(), Some(json_path));
     assert_eq!(app.selected_task(), Some(second_request));
+    assert_eq!(
+        app.profile(),
+        ExplanationProfile::new(ExplanationAudience::Expert, ExplanationDepth::Code)
+    );
+    assert!(app.selected_budget().is_none());
     assert_eq!(app.conversation().len(), 4);
     assert_eq!(app.evidence().len(), 2);
     assert_eq!(app.tools().len(), 2);
@@ -1503,6 +1770,10 @@ fn history_load_restores_complete_context_and_scopes_workflow_by_task() {
     let _ = app.handle_key(key(KeyCode::Char('[')));
     let first_task = rendered_text(&mut app, 80, 30);
     assert_eq!(app.selected_task(), Some(first_request));
+    assert_eq!(
+        app.profile(),
+        ExplanationProfile::new(ExplanationAudience::Beginner, ExplanationDepth::Overview)
+    );
     assert!(first_task.contains("FIRST_HISTORY_PROGRESS"));
     assert!(first_task.contains("FIRST_HISTORY_TOOL"));
     assert!(!first_task.contains("SECOND_HISTORY_TOOL"));
@@ -1517,14 +1788,17 @@ fn history_load_restores_complete_context_and_scopes_workflow_by_task() {
             request_id,
             session_id: command_session,
             repository_id: command_repository,
+            profile,
             ..
         } => {
             assert_eq!(command_session, session_id);
             assert_eq!(command_repository, repository_id);
             assert_ne!(request_id, first_request);
             assert_ne!(request_id, second_request);
+            assert_eq!(profile, app.profile());
         }
         AppCommand::Index { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
@@ -1559,6 +1833,8 @@ fn failed_history_load_closes_the_modal_and_ignores_its_late_response() {
             tasks: vec![SessionTaskSummary {
                 request_id: historical_task,
                 question: "Late history task".to_owned(),
+                profile: ExplanationProfile::default(),
+                status: codeatlas_core::SessionTaskStatus::Completed,
             }],
             json_path: "/data/sessions/late.json".to_owned(),
         }],
@@ -1597,8 +1873,17 @@ fn failed_history_load_closes_the_modal_and_ignores_its_late_response() {
             tasks: vec![SessionTask {
                 request_id: historical_task,
                 question: "Late history task".to_owned(),
-                answer: sample_answer(&evidence),
-                workflow: Vec::new(),
+                profile: ExplanationProfile::default(),
+                status: codeatlas_core::SessionTaskStatus::Completed,
+                answer: Some(sample_answer(&evidence)),
+                terminal_error: None,
+                budget_stop_reason: None,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                trajectory: Vec::new(),
+                model_calls: Vec::new(),
+                usage: None,
+                budget: None,
             }],
             usage: ModelUsage {
                 tokens: TokenUsage::default(),
@@ -1609,6 +1894,86 @@ fn failed_history_load_closes_the_modal_and_ignores_its_late_response() {
     });
     assert_eq!(app.session_id(), original_session);
     assert!(app.conversation().is_empty());
+}
+
+#[test]
+fn restored_cancelled_task_sets_terminal_activity_and_finishes_started_tools() {
+    let mut app = TuiApp::new("cancelled-history");
+    let repository_id = complete_index(&mut app, "/repo");
+    let AppCommand::ListSessions {
+        request_id: list_request,
+        ..
+    } = app
+        .handle_key(key(KeyCode::Char('h')))
+        .expect("history list command")
+    else {
+        panic!("expected history list command");
+    };
+    let session_id = SessionId::from_stable_parts(&["cancelled-history-session"]);
+    let task_request = id_request("cancelled-history-task");
+    app.reduce(AppEvent::SessionsListed {
+        request_id: list_request,
+        sessions: vec![SessionSummary {
+            session_id,
+            repository_id,
+            tasks: vec![SessionTaskSummary {
+                request_id: task_request,
+                question: "Cancelled history task".to_owned(),
+                profile: ExplanationProfile::default(),
+                status: codeatlas_core::SessionTaskStatus::Cancelled,
+            }],
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            json_path: "cancelled.json".to_owned(),
+        }],
+    });
+    let AppCommand::LoadSession {
+        request_id: load_request,
+        ..
+    } = app
+        .handle_key(key(KeyCode::Enter))
+        .expect("session load command")
+    else {
+        panic!("expected session load command");
+    };
+    let tool_id = ToolCallId::from_stable_parts(&["cancelled-history-tool"]);
+    app.reduce(AppEvent::SessionLoaded {
+        request_id: load_request,
+        session: SessionContext {
+            schema_version: 3,
+            session_id,
+            repository_id,
+            tasks: vec![SessionTask {
+                request_id: task_request,
+                question: "Cancelled history task".to_owned(),
+                profile: ExplanationProfile::default(),
+                status: codeatlas_core::SessionTaskStatus::Cancelled,
+                answer: None,
+                terminal_error: None,
+                budget_stop_reason: None,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                trajectory: vec![WorkflowEvent::ToolCallStarted(ToolCall {
+                    id: tool_id,
+                    name: "read_file".to_owned(),
+                    arguments: json!({"path": "src/lib.rs"}),
+                })],
+                model_calls: Vec::new(),
+                usage: None,
+                budget: None,
+            }],
+            usage: ModelUsage {
+                tokens: TokenUsage::default(),
+                cost: None,
+            },
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            json_path: "cancelled.json".to_owned(),
+        },
+    });
+
+    assert_eq!(app.activity(), Activity::Cancelled);
+    assert_eq!(app.tools()[0].status, ToolTraceStatus::Cancelled);
 }
 
 #[test]
@@ -1638,6 +2003,8 @@ fn index_completion_ignores_unsolicited_history_restoration_and_allows_ask() {
         tasks: vec![SessionTaskSummary {
             request_id: RequestId::from_stable_parts(&["ambiguous-history-task", label]),
             question: format!("History task {label}"),
+            profile: ExplanationProfile::default(),
+            status: codeatlas_core::SessionTaskStatus::Completed,
         }],
         json_path: format!("/data/sessions/{label}.json"),
     };
@@ -1681,10 +2048,7 @@ fn uppercase_n_starts_an_empty_session_while_lowercase_n_navigates_tools() {
     let old_session = app.session_id();
     let request_id = id_request("new-session-context");
     let evidence = sample_evidence("new-session", "src/new_session.rs", 1);
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id,
-        answer: sample_answer(&evidence),
-    });
+    complete_answer(&mut app, request_id, sample_answer(&evidence));
     for label in ["first", "second"] {
         app.reduce(AppEvent::ToolCallStarted {
             request_id,
@@ -1815,6 +2179,7 @@ fn cancellation_event_may_identify_the_target_request() {
     let ask_request = match app.submit_question().expect("ask command") {
         AppCommand::Ask { request_id, .. } => request_id,
         AppCommand::Index { .. }
+        | AppCommand::RunSuggestedAction { .. }
         | AppCommand::LoadSource { .. }
         | AppCommand::Cancel { .. }
         | AppCommand::ListSessions { .. }
@@ -1889,6 +2254,13 @@ fn reducer_handles_evidence_streaming_answers_and_usage() {
     let mut app = TuiApp::new("answer-reducer");
     let answer_request = id_request("answer");
     let evidence = sample_evidence("answer-evidence", "src/router.rs", 10);
+    let unsolicited_request = id_request("unsolicited-answer");
+    app.reduce(AppEvent::AnswerCompleted {
+        request_id: unsolicited_request,
+        answer: sample_answer(&evidence),
+    });
+    assert!(app.conversation().is_empty());
+
     app.reduce(AppEvent::EvidenceAdded {
         request_id: answer_request,
         evidence: evidence.clone(),
@@ -1899,6 +2271,7 @@ fn reducer_handles_evidence_streaming_answers_and_usage() {
     });
     assert!(app.evidence().is_empty());
 
+    app.expect_answer_for_test(answer_request);
     app.reduce(AppEvent::AnswerDelta {
         request_id: answer_request,
         delta: "partial ".to_owned(),
@@ -1914,14 +2287,8 @@ fn reducer_handles_evidence_streaming_answers_and_usage() {
     assert_eq!(streaming.and_then(|answer| answer.diagram.as_ref()), None);
     let answer = sample_answer(&evidence);
     let expected_diagram = answer.diagram.clone();
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: answer_request,
-        answer: answer.clone(),
-    });
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: answer_request,
-        answer,
-    });
+    complete_answer(&mut app, answer_request, answer.clone());
+    complete_answer(&mut app, answer_request, answer);
     app.reduce(AppEvent::AnswerDelta {
         request_id: answer_request,
         delta: "stale".to_owned(),
@@ -1972,10 +2339,7 @@ fn evidence_panel_shows_completed_citations_with_claim_context() {
     });
     assert!(app.evidence().is_empty());
 
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id,
-        answer: sample_answer(&cited),
-    });
+    complete_answer(&mut app, request_id, sample_answer(&cited));
     let _ = app.handle_key(key(KeyCode::Esc));
     let _ = app.handle_key(key(KeyCode::Char('e')));
     let text = rendered_text(&mut app, 100, 28);
@@ -2020,10 +2384,7 @@ fn conversation_and_evidence_share_fact_numbers_across_answers() {
         evidence_ids: vec![first_evidence.id],
     }];
     first_answer.call_paths.clear();
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: id_request("multi-first-answer"),
-        answer: first_answer,
-    });
+    complete_answer(&mut app, id_request("multi-first-answer"), first_answer);
 
     let mut second_answer = sample_answer(&second_evidence);
     second_answer.text = "Second completed answer.".to_owned();
@@ -2034,10 +2395,7 @@ fn conversation_and_evidence_share_fact_numbers_across_answers() {
         evidence_ids: vec![second_evidence.id],
     }];
     second_answer.call_paths.clear();
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: id_request("multi-second-answer"),
-        answer: second_answer,
-    });
+    complete_answer(&mut app, id_request("multi-second-answer"), second_answer);
 
     let _ = app.handle_key(key(KeyCode::Esc));
     let _ = app.handle_key(key(KeyCode::Char('2')));
@@ -2126,10 +2484,7 @@ fn non_fatal_postprocessing_error_does_not_hide_completed_answer() {
             retryable: true,
         },
     });
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id,
-        answer: sample_answer(&evidence),
-    });
+    complete_answer(&mut app, request_id, sample_answer(&evidence));
 
     assert_eq!(app.activity(), Activity::AnswerReady);
     assert!(app.conversation().iter().any(|entry| matches!(
@@ -2194,10 +2549,7 @@ fn facts_references_trace_and_source_excerpt_are_visible() {
     let mut app = TuiApp::new("grounded-render");
     let request_id = id_request("grounded-answer");
     let evidence = sample_evidence("grounded", "src/router.rs", 10);
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id,
-        answer: sample_answer(&evidence),
-    });
+    complete_answer(&mut app, request_id, sample_answer(&evidence));
 
     let text = rendered_text(&mut app, 160, 40);
     assert!(text.contains("[F1] [E1] route calls service.call"));
@@ -2228,10 +2580,7 @@ fn conversation_renders_all_needed_diagram_kinds_and_artifact_states() {
         let evidence = sample_evidence(label, "src/router.rs", 10);
         let mut answer = sample_answer(&evidence);
         answer.diagram = sample_needed_diagram(kind, evidence.id, artifact_path);
-        app.reduce(AppEvent::AnswerCompleted {
-            request_id: id_request(label),
-            answer,
-        });
+        complete_answer(&mut app, id_request(label), answer);
 
         let text = rendered_text(&mut app, 160, 40);
         assert!(text.contains(&format!("[DIAGRAM: {label}] Request routing")));
@@ -2262,7 +2611,7 @@ fn selected_diagram_opens_with_one_key_and_copies_its_path() {
         panic!("sample diagram should be needed");
     };
     let diagram_id = diagram.artifact.as_ref().expect("sample artifact").id;
-    app.reduce(AppEvent::AnswerCompleted { request_id, answer });
+    complete_answer(&mut app, request_id, answer);
     let _ = app.handle_key(key(KeyCode::Esc));
 
     let command = app
@@ -2348,10 +2697,7 @@ fn diagram_evidence_references_are_deduplicated_and_bounded() {
     diagram.nodes[2].evidence_ids = vec![evidence[6].id, evidence[7].id];
     diagram.edges[0].evidence_ids = vec![evidence[7].id, evidence[8].id];
     diagram.edges[1].evidence_ids = vec![evidence[9].id];
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: id_request("diagram-evidence-bound"),
-        answer,
-    });
+    complete_answer(&mut app, id_request("diagram-evidence-bound"), answer);
 
     let text = rendered_text(&mut app, 160, 40);
     assert!(text.contains("grounded by [E1,E2,E3,E4,E5,E6,E7,E8]"));
@@ -2368,10 +2714,7 @@ fn not_needed_diagram_is_a_single_muted_summary_line() {
     answer.diagram = DiagramDecision::NotNeeded {
         reason: "A direct lookup fully answers the question.".to_owned(),
     };
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: id_request("diagram-not-needed"),
-        answer,
-    });
+    complete_answer(&mut app, id_request("diagram-not-needed"), answer);
 
     let text = rendered_text(&mut app, 160, 40);
     assert!(text.contains("[DIAGRAM] not needed: A direct lookup fully answers the question."));
@@ -2401,10 +2744,7 @@ fn diagram_control_sequences_render_as_plain_text_only() {
     };
     *reason = "why\u{1b}]52;c;payload\u{7}".to_owned();
     diagram.title = "\u{1b}]8;;x\u{7}title\u{1b}]8;;\u{7}".to_owned();
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: id_request("diagram-control-text"),
-        answer,
-    });
+    complete_answer(&mut app, id_request("diagram-control-text"), answer);
 
     let text = rendered_text(&mut app, 220, 50);
     assert!(!text.contains('\u{1b}'));
@@ -2429,10 +2769,7 @@ fn diagram_summary_wraps_without_panicking_in_all_layout_modes() {
     diagram.title = "A relationship summary that wraps on a narrow terminal".to_owned();
 
     let mut base = TuiApp::new("diagram-layouts");
-    base.reduce(AppEvent::AnswerCompleted {
-        request_id: id_request("diagram-layouts"),
-        answer,
-    });
+    complete_answer(&mut base, id_request("diagram-layouts"), answer);
     let _ = base.handle_key(key(KeyCode::Esc));
     let _ = base.handle_key(key(KeyCode::Char('2')));
 
@@ -2472,10 +2809,7 @@ fn conversation_renders_common_markdown_without_source_markers() {
     answer.evidence.clear();
     answer.call_paths.clear();
     answer.usage = None;
-    app.reduce(AppEvent::AnswerCompleted {
-        request_id: id_request("markdown-answer"),
-        answer,
-    });
+    complete_answer(&mut app, id_request("markdown-answer"), answer);
 
     let text = rendered_text(&mut app, 160, 40);
     assert!(text.contains("Architecture for C#"));

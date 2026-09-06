@@ -6,11 +6,12 @@ use std::{
 };
 
 use codeatlas_core::{
-    AgentAnswer, AnswerId, AppError, AppEvent, CallPath, CallPathId, Claim, ClaimId, ClaimKind,
-    Diagram, DiagramDecision, DiagramEdge, DiagramNode, Evidence, EvidenceId,
-    EvidenceValidationError, ModelUsage, Progress, ProgressPhase, RepositoryId, RequestId,
-    SessionId, TokenUsage, ToolCall, ToolCallId, ToolDefinition, ToolError, ToolExecutor,
-    ToolOutput,
+    AgentAnswer, AnswerId, AppError, AppEvent, BudgetStopReason, CallPath, CallPathId, Claim,
+    ClaimId, ClaimKind, Diagram, DiagramDecision, DiagramEdge, DiagramNode, Evidence, EvidenceId,
+    EvidenceValidationError, ExplanationProfile, FileId, ModelBudget, ModelBudgetStatus,
+    ModelCallId, ModelCallOutcome, ModelCallRecord, ModelUsage, MonetaryBudget, Progress,
+    ProgressPhase, RepositoryId, RequestId, SessionId, SuggestedAction, TokenUsage, ToolCall,
+    ToolCallId, ToolDefinition, ToolError, ToolExecutor, ToolOutput, WorkflowEvent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -65,6 +66,7 @@ pub const SUBMIT_ANSWER_TOOL_NAME: &str = "submit_answer";
 const MAX_ANSWER_REPAIRS: u8 = 1;
 const ANSWER_REPAIR_PROMPT: &str = r"Your previous response was not submitted in CodeAtlas's structured answer format. Do not perform more repository exploration. Call submit_answer exactly once now with text, claims, call_paths, and an explicit diagram decision. The top-level text field is mandatory and must contain the complete human-readable answer. Preserve the meaning of your previous response, classify every claim as fact, inference, or unknown, and cite only evidence IDs already returned by tools. Every fact requires at least one evidence ID, and every call-path step may cite only returned evidence IDs. Choose needed only for a semantically valuable, ambiguity-reducing diagram whose every node and edge links to directly supporting fact claim_indices; CodeAtlas derives diagram evidence from those claims. Otherwise choose not_needed and explain why.";
 const ANSWER_VALIDATION_REPAIR_PROMPT: &str = r"Your previous structured answer failed strict final-answer validation. The top-level text must contain a non-blank human-readable answer. Keep evidence validation strict: never invent an evidence ID. Correct every fact and call-path step to use only evidence IDs actually returned by repository tools. For a needed diagram, correct its node IDs, edge endpoints, and zero-based fact claim_indices; CodeAtlas derives each element's evidence from those claims. If the user explicitly requested a diagram, keep decision needed and repair it rather than substituting prose or text art. All registered read-only repository tools remain available: if additional evidence is essential, call them in separate turns before resubmitting. Once the answer is valid, call submit_answer exactly once in its own turn with the corrected complete answer.";
+const MODEL_WAIT_HEARTBEAT: Duration = Duration::from_secs(5);
 
 /// The required envelope for every successful repository tool result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +88,8 @@ pub struct RuntimeConfig {
     pub model_retry_initial_delay: Duration,
     /// Optional explicit rates; no cost is guessed when this is absent.
     pub pricing: Option<ModelPricing>,
+    /// Optional per-task token and monetary hard limits.
+    pub budget: ModelBudget,
 }
 
 impl Default for RuntimeConfig {
@@ -96,17 +100,21 @@ impl Default for RuntimeConfig {
             max_gateway_retries: 5,
             model_retry_initial_delay: Duration::from_secs(1),
             pricing: None,
+            budget: ModelBudget::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRequest {
     pub request_id: RequestId,
     pub session_id: SessionId,
     pub repository_id: RepositoryId,
     pub question: String,
-    pub history: Vec<ConversationMessage>,
+    #[serde(default)]
+    pub profile: ExplanationProfile,
+    #[serde(default)]
+    pub history: Vec<ModelMessage>,
 }
 
 impl AgentRequest {
@@ -122,13 +130,32 @@ impl AgentRequest {
             session_id,
             repository_id,
             question: question.into(),
+            profile: ExplanationProfile::default(),
             history: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_history(mut self, history: Vec<ConversationMessage>) -> Self {
+        self.history = history
+            .into_iter()
+            .map(|message| match message.role {
+                ConversationRole::User => ModelMessage::user(message.content),
+                ConversationRole::Assistant => ModelMessage::assistant(message.content),
+            })
+            .collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_transcript(mut self, history: Vec<ModelMessage>) -> Self {
         self.history = history;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_profile(mut self, profile: ExplanationProfile) -> Self {
+        self.profile = profile;
         self
     }
 }
@@ -292,19 +319,32 @@ impl AgentRuntime {
             "planning repository exploration",
         );
 
-        let mut messages = Vec::with_capacity(request.history.len().saturating_add(2));
+        let mut messages = Vec::with_capacity(request.history.len().saturating_add(3));
         messages.push(ModelMessage::system(SYSTEM_PROMPT));
-        for message in &request.history {
-            messages.push(match message.role {
-                ConversationRole::User => ModelMessage::user(message.content.clone()),
-                ConversationRole::Assistant => ModelMessage::assistant(message.content.clone()),
+        messages.extend(request.history.clone());
+        let current_task_start = messages.len();
+        append_observable_message(
+            &mut messages,
+            ModelMessage::system(request.profile.control_message()),
+            events,
+            request.request_id,
+        );
+        append_observable_message(
+            &mut messages,
+            ModelMessage::user(request.question.clone()),
+            events,
+            request.request_id,
+        );
+
+        let mut evidence = evidence_from_history(&request.history, request.repository_id);
+        let mut model_evidence = HashMap::new();
+        let mut meter = TaskMeter::default();
+        if self.config.budget.is_enabled() {
+            events.emit(AppEvent::BudgetUpdated {
+                request_id: request.request_id,
+                status: self.budget_status(&meter),
             });
         }
-        messages.push(ModelMessage::user(request.question.clone()));
-
-        let mut evidence = EvidenceCollector::default();
-        let mut model_evidence = HashMap::new();
-        let mut usage = None;
         let mut tool_call_count = 0_usize;
         let mut provider_call_ids = HashSet::new();
         let mut format_repairs = 0_u8;
@@ -329,6 +369,8 @@ impl AgentRuntime {
                     deadline,
                     events,
                     provider_context_overflowed,
+                    current_task_start,
+                    &mut meter,
                 )
                 .await?;
             provider_context_overflowed |= context_overflowed;
@@ -338,16 +380,7 @@ impl AgentRuntime {
                 self.config.timeout,
                 "after a model response",
             )?;
-            if let Some(response_usage) = response.usage {
-                let cumulative =
-                    add_token_usage(usage.unwrap_or_default(), normalize_usage(response_usage));
-                usage = Some(cumulative);
-                events.emit(AppEvent::UsageUpdated {
-                    request_id: request.request_id,
-                    usage: self.model_usage(cumulative),
-                });
-            }
-            let model_usage = usage.map(|tokens| self.model_usage(tokens));
+            let model_usage = meter.usage.map(|tokens| self.model_usage(tokens));
             match response.output {
                 AssistantOutput::FinalAnswer { answer } => {
                     match finalize_answer(
@@ -357,7 +390,14 @@ impl AgentRuntime {
                         evidence.snapshot(),
                         model_usage,
                     ) {
-                        Ok(answer) => return Ok(answer),
+                        Ok(answer) => {
+                            record_observable_message(
+                                events,
+                                request.request_id,
+                                &ModelMessage::assistant(answer.text.clone()),
+                            );
+                            return Ok(answer);
+                        }
                         Err(error) if error.is_repairable_final_answer() => {
                             let prompt = prepare_answer_validation_repair(
                                 events,
@@ -366,7 +406,12 @@ impl AgentRuntime {
                                 evidence.values(),
                                 &mut validation_repairs,
                             )?;
-                            messages.push(ModelMessage::user(prompt));
+                            append_observable_message(
+                                &mut messages,
+                                ModelMessage::user(prompt),
+                                events,
+                                request.request_id,
+                            );
                         }
                         Err(error) => return Err(error),
                     }
@@ -377,9 +422,14 @@ impl AgentRuntime {
                             return Err(RuntimeError::EmptyToolCalls);
                         }
                         format_repairs = format_repairs.saturating_add(1);
-                        messages.push(ModelMessage::user(format!(
-                            "{ANSWER_REPAIR_PROMPT}\n\nProtocol error: the previous tool-call turn contained no tool calls."
-                        )));
+                        append_observable_message(
+                            &mut messages,
+                            ModelMessage::user(format!(
+                                "{ANSWER_REPAIR_PROMPT}\n\nProtocol error: the previous tool-call turn contained no tool calls."
+                            )),
+                            events,
+                            request.request_id,
+                        );
                         continue;
                     }
                     for call in &calls {
@@ -390,10 +440,15 @@ impl AgentRuntime {
                                 });
                             }
                             format_repairs = format_repairs.saturating_add(1);
-                            messages.push(ModelMessage::user(format!(
-                                "{ANSWER_REPAIR_PROMPT}\n\nProtocol error: tool call IDs must be non-empty and unique; the invalid ID was {:?}.",
-                                call.id
-                            )));
+                            append_observable_message(
+                                &mut messages,
+                                ModelMessage::user(format!(
+                                    "{ANSWER_REPAIR_PROMPT}\n\nProtocol error: tool call IDs must be non-empty and unique; the invalid ID was {:?}.",
+                                    call.id
+                                )),
+                                events,
+                                request.request_id,
+                            );
                             continue 'agent;
                         }
                     }
@@ -407,9 +462,14 @@ impl AgentRuntime {
                                 return Err(RuntimeError::MixedFinalAnswerToolCalls);
                             }
                             format_repairs = format_repairs.saturating_add(1);
-                            messages.push(ModelMessage::user(format!(
-                                "{ANSWER_REPAIR_PROMPT}\n\nProtocol error: submit_answer must be the only tool call in its turn."
-                            )));
+                            append_observable_message(
+                                &mut messages,
+                                ModelMessage::user(format!(
+                                    "{ANSWER_REPAIR_PROMPT}\n\nProtocol error: submit_answer must be the only tool call in its turn."
+                                )),
+                                events,
+                                request.request_id,
+                            );
                             continue;
                         }
                         let call = calls
@@ -425,7 +485,14 @@ impl AgentRuntime {
                                     evidence.snapshot(),
                                     model_usage,
                                 ) {
-                                    Ok(answer) => return Ok(answer),
+                                    Ok(answer) => {
+                                        record_observable_message(
+                                            events,
+                                            request.request_id,
+                                            &ModelMessage::assistant(answer.text.clone()),
+                                        );
+                                        return Ok(answer);
+                                    }
                                     Err(error) if error.is_repairable_final_answer() => {
                                         let validation_message = error.to_string();
                                         let validation_code = if error.is_diagram_validation_error()
@@ -446,22 +513,37 @@ impl AgentRuntime {
                                             evidence.values(),
                                             &mut validation_repairs,
                                         )?;
-                                        messages.push(ModelMessage::assistant_tool_calls(
-                                            content,
-                                            vec![call.clone()],
-                                        ));
-                                        messages.push(ModelMessage::tool(
-                                            call.id,
-                                            call.name,
-                                            json!({
-                                                "error": {
-                                                    "code": validation_code,
-                                                    "message": validation_message
-                                                }
-                                            })
-                                            .to_string(),
-                                        ));
-                                        messages.push(ModelMessage::user(prompt));
+                                        append_observable_message(
+                                            &mut messages,
+                                            ModelMessage::assistant_tool_calls(
+                                                content,
+                                                vec![call.clone()],
+                                            ),
+                                            events,
+                                            request.request_id,
+                                        );
+                                        append_observable_message(
+                                            &mut messages,
+                                            ModelMessage::tool(
+                                                call.id,
+                                                call.name,
+                                                json!({
+                                                     "error": {
+                                                         "code": validation_code,
+                                                         "message": validation_message
+                                                     }
+                                                })
+                                                .to_string(),
+                                            ),
+                                            events,
+                                            request.request_id,
+                                        );
+                                        append_observable_message(
+                                            &mut messages,
+                                            ModelMessage::user(prompt),
+                                            events,
+                                            request.request_id,
+                                        );
                                         continue;
                                     }
                                     Err(error) => return Err(error),
@@ -483,30 +565,47 @@ impl AgentRuntime {
                                     ProgressPhase::Explaining,
                                     &progress_message,
                                 );
-                                messages.push(ModelMessage::assistant_tool_calls(
-                                    content,
-                                    vec![call.clone()],
-                                ));
-                                messages.push(ModelMessage::tool(
-                                    call.id,
-                                    call.name,
-                                    json!({
-                                        "error": {
-                                            "code": "invalid_submit_answer",
-                                            "message": message
-                                        }
-                                    })
-                                    .to_string(),
-                                ));
-                                messages.push(ModelMessage::user(format!(
-                                    "{ANSWER_REPAIR_PROMPT}\n\nValidation error: {message}"
-                                )));
+                                append_observable_message(
+                                    &mut messages,
+                                    ModelMessage::assistant_tool_calls(content, vec![call.clone()]),
+                                    events,
+                                    request.request_id,
+                                );
+                                append_observable_message(
+                                    &mut messages,
+                                    ModelMessage::tool(
+                                        call.id,
+                                        call.name,
+                                        json!({
+                                            "error": {
+                                                "code": "invalid_submit_answer",
+                                                "message": message
+                                            }
+                                        })
+                                        .to_string(),
+                                    ),
+                                    events,
+                                    request.request_id,
+                                );
+                                append_observable_message(
+                                    &mut messages,
+                                    ModelMessage::user(format!(
+                                        "{ANSWER_REPAIR_PROMPT}\n\nValidation error: {message}"
+                                    )),
+                                    events,
+                                    request.request_id,
+                                );
                                 continue;
                             }
                         }
                     }
 
-                    messages.push(ModelMessage::assistant_tool_calls(content, calls.clone()));
+                    append_observable_message(
+                        &mut messages,
+                        ModelMessage::assistant_tool_calls(content, calls.clone()),
+                        events,
+                        request.request_id,
+                    );
 
                     for call in calls {
                         ensure_active(
@@ -629,6 +728,16 @@ impl AgentRuntime {
                             envelope.as_ref(),
                             &mut model_evidence,
                         );
+                        events.emit(AppEvent::TaskTraceRecorded {
+                            request_id: request.request_id,
+                            event: WorkflowEvent::Message(serialized_trace_value(
+                                &ModelMessage::tool(
+                                    call.id.clone(),
+                                    core_call.name.clone(),
+                                    compacted.clone(),
+                                ),
+                            )),
+                        });
                         messages.push(ModelMessage::tool(call.id, core_call.name, compacted));
                     }
                 }
@@ -645,13 +754,28 @@ impl AgentRuntime {
                         ProgressPhase::Explaining,
                         "model returned prose; requesting structured answer repair",
                     );
-                    messages.push(ModelMessage::assistant(content));
-                    messages.push(ModelMessage::user(ANSWER_REPAIR_PROMPT));
+                    append_observable_message(
+                        &mut messages,
+                        ModelMessage::assistant(content),
+                        events,
+                        request.request_id,
+                    );
+                    append_observable_message(
+                        &mut messages,
+                        ModelMessage::user(ANSWER_REPAIR_PROMPT),
+                        events,
+                        request.request_id,
+                    );
                 }
             }
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "request retries, attempt ledger emission, and budget gates must remain one atomic lifecycle"
+    )]
     async fn complete_model(
         &self,
         request: ModelRequest,
@@ -660,6 +784,8 @@ impl AgentRuntime {
         deadline: Instant,
         events: &dyn EventSink,
         force_context_reduction: bool,
+        current_task_start: usize,
+        meter: &mut TaskMeter,
     ) -> Result<(ModelResponse, bool), RuntimeError> {
         let max_retries = usize::from(
             self.config
@@ -667,24 +793,132 @@ impl AgentRuntime {
                 .max(self.config.max_gateway_retries),
         );
         let mut retry_request = request;
-        compact_request_to_model_window(&mut retry_request, self.model.context_window_tokens());
+        let mut protected_message_index = current_task_start;
+        compact_request_to_model_window(
+            &mut retry_request,
+            self.model.context_window_tokens(),
+            &mut protected_message_index,
+        );
         if force_context_reduction {
-            compact_request_after_overflow(&mut retry_request);
+            compact_request_after_overflow(&mut retry_request, &mut protected_message_index);
         }
         let mut context_compacted = false;
         let mut context_overflowed = false;
         for attempt in 0..=max_retries {
-            let result = controlled(
+            if let Some(reason) = self.reached_budget(meter) {
+                return Err(self.stop_for_budget(request_id, meter, reason, events));
+            }
+            let sequence = meter.next_sequence();
+            let call_id = stable_model_call_id(request_id, sequence);
+            events.emit(AppEvent::TaskTraceRecorded {
+                request_id,
+                event: WorkflowEvent::ModelRequest {
+                    call_id,
+                    sequence,
+                    model: self.model.model_name().to_owned(),
+                    request: serialized_trace_value(&retry_request),
+                },
+            });
+            let result = controlled_model_wait(
                 self.model.complete(retry_request.clone()),
                 cancellation,
                 deadline,
                 self.config.timeout,
-                "waiting for a model response",
+                request_id,
+                events,
             )
-            .await?;
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    events.emit(AppEvent::TaskTraceRecorded {
+                        request_id,
+                        event: WorkflowEvent::ModelError {
+                            call_id,
+                            sequence,
+                            message: error.to_string(),
+                        },
+                    });
+                    let outcome = match error {
+                        RuntimeError::Cancelled => ModelCallOutcome::Cancelled,
+                        RuntimeError::Timeout { .. } => ModelCallOutcome::TimedOut,
+                        _ => ModelCallOutcome::Failed {
+                            message: error.to_string(),
+                            retryable: false,
+                        },
+                    };
+                    self.emit_model_call(request_id, call_id, sequence, outcome, None, events);
+                    return Err(error);
+                }
+            };
             match result {
-                Ok(response) => return Ok((response, context_overflowed)),
+                Ok(mut response) => {
+                    response.usage = response.usage.map(normalize_usage);
+                    events.emit(AppEvent::TaskTraceRecorded {
+                        request_id,
+                        event: WorkflowEvent::ModelResponse {
+                            call_id,
+                            sequence,
+                            response: serialized_trace_value(&response),
+                        },
+                    });
+                    let per_call_usage = response.usage;
+                    self.emit_model_call(
+                        request_id,
+                        call_id,
+                        sequence,
+                        ModelCallOutcome::Succeeded,
+                        per_call_usage,
+                        events,
+                    );
+                    let Some(response_usage) = per_call_usage else {
+                        if self.config.budget.is_enabled() {
+                            return Err(self.stop_for_budget(
+                                request_id,
+                                meter,
+                                BudgetStopReason::UsageUnavailable,
+                                events,
+                            ));
+                        }
+                        return Ok((response, context_overflowed));
+                    };
+                    meter.usage = Some(add_token_usage(
+                        meter.usage.unwrap_or_default(),
+                        response_usage,
+                    ));
+                    let cumulative = self.model_usage(meter.usage.unwrap_or_default());
+                    events.emit(AppEvent::UsageUpdated {
+                        request_id,
+                        usage: cumulative,
+                    });
+                    if self.config.budget.is_enabled() {
+                        events.emit(AppEvent::BudgetUpdated {
+                            request_id,
+                            status: self.budget_status(meter),
+                        });
+                    }
+                    if let Some(reason) = self.reached_budget(meter) {
+                        return Err(self.stop_for_budget(request_id, meter, reason, events));
+                    }
+                    return Ok((response, context_overflowed));
+                }
                 Err(error) if error.is_retryable() => {
+                    events.emit(AppEvent::TaskTraceRecorded {
+                        request_id,
+                        event: WorkflowEvent::ModelError {
+                            call_id,
+                            sequence,
+                            message: error.to_string(),
+                        },
+                    });
+                    self.emit_model_call(
+                        request_id,
+                        call_id,
+                        sequence,
+                        retryable_model_outcome(&error),
+                        None,
+                        events,
+                    );
                     let retry_limit = usize::from(if error.is_gateway_unavailable() {
                         self.config.max_gateway_retries
                     } else {
@@ -704,7 +938,10 @@ impl AgentRuntime {
                     );
                     if error.is_context_overflow() {
                         context_overflowed = true;
-                        context_compacted |= compact_request_after_overflow(&mut retry_request);
+                        context_compacted |= compact_request_after_overflow(
+                            &mut retry_request,
+                            &mut protected_message_index,
+                        );
                     }
                     let context = if context_compacted {
                         " with compacted tool context"
@@ -730,7 +967,28 @@ impl AgentRuntime {
                     )
                     .await?;
                 }
-                Err(error) => return Err(RuntimeError::Model(error)),
+                Err(error) => {
+                    events.emit(AppEvent::TaskTraceRecorded {
+                        request_id,
+                        event: WorkflowEvent::ModelError {
+                            call_id,
+                            sequence,
+                            message: error.to_string(),
+                        },
+                    });
+                    self.emit_model_call(
+                        request_id,
+                        call_id,
+                        sequence,
+                        ModelCallOutcome::Failed {
+                            message: error.to_string(),
+                            retryable: error.is_retryable(),
+                        },
+                        None,
+                        events,
+                    );
+                    return Err(RuntimeError::Model(error));
+                }
             }
         }
         unreachable!("model retry loop always returns")
@@ -746,6 +1004,179 @@ impl AgentRuntime {
             .unwrap_or(None);
         ModelUsage { tokens, cost }
     }
+
+    fn emit_model_call(
+        &self,
+        request_id: RequestId,
+        id: ModelCallId,
+        sequence: u64,
+        outcome: ModelCallOutcome,
+        usage: Option<TokenUsage>,
+        events: &dyn EventSink,
+    ) {
+        let cost = usage.and_then(|tokens| self.model_usage(tokens).cost);
+        events.emit(AppEvent::ModelCallRecorded {
+            request_id,
+            record: ModelCallRecord {
+                id,
+                sequence,
+                model: self.model.model_name().to_owned(),
+                outcome,
+                usage,
+                cost,
+            },
+        });
+    }
+
+    fn budget_status(&self, meter: &TaskMeter) -> ModelBudgetStatus {
+        ModelBudgetStatus {
+            budget: self.config.budget.clone(),
+            usage: self.model_usage(meter.usage.unwrap_or_default()),
+        }
+    }
+
+    fn reached_budget(&self, meter: &TaskMeter) -> Option<BudgetStopReason> {
+        let usage = self.model_usage(meter.usage.unwrap_or_default());
+        if let Some(limit) = self.config.budget.max_total_tokens
+            && usage.tokens.total_tokens >= limit
+        {
+            return Some(BudgetStopReason::TotalTokensReached {
+                used: usage.tokens.total_tokens,
+                limit,
+            });
+        }
+        let limit = self.config.budget.max_cost.as_ref()?;
+        let used = usage.cost.as_ref()?.amount;
+        (used >= limit.amount).then(|| BudgetStopReason::CostReached {
+            used,
+            limit: limit.clone(),
+        })
+    }
+
+    fn stop_for_budget(
+        &self,
+        request_id: RequestId,
+        meter: &TaskMeter,
+        reason: BudgetStopReason,
+        events: &dyn EventSink,
+    ) -> RuntimeError {
+        events.emit(AppEvent::BudgetExceeded {
+            request_id,
+            status: self.budget_status(meter),
+            reason: reason.clone(),
+        });
+        match reason {
+            BudgetStopReason::TotalTokensReached { used, limit } => {
+                RuntimeError::TokenBudgetExceeded { used, limit }
+            }
+            BudgetStopReason::CostReached { used, limit } => {
+                RuntimeError::CostBudgetExceeded { used, limit }
+            }
+            BudgetStopReason::UsageUnavailable => RuntimeError::BudgetUnenforceable,
+        }
+    }
+}
+
+fn retryable_model_outcome(error: &ModelError) -> ModelCallOutcome {
+    if matches!(error, ModelError::Timeout { .. }) {
+        ModelCallOutcome::TimedOut
+    } else {
+        ModelCallOutcome::Failed {
+            message: error.to_string(),
+            retryable: true,
+        }
+    }
+}
+
+fn serialized_trace_value(value: &impl Serialize) -> Value {
+    serde_json::to_value(value).unwrap_or_else(|error| {
+        json!({
+            "serialization_error": error.to_string(),
+        })
+    })
+}
+
+fn evidence_from_history(
+    history: &[ModelMessage],
+    repository_id: RepositoryId,
+) -> EvidenceCollector {
+    let mut evidence = EvidenceCollector::default();
+    for message in history {
+        if message.role != crate::ModelRole::Tool {
+            continue;
+        }
+        let Some(content) = message.content.as_deref() else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(content) else {
+            continue;
+        };
+        if let Some(items) = value.get_mut("evidence").and_then(Value::as_array_mut) {
+            for item in items {
+                let Some(item) = item.as_object_mut() else {
+                    continue;
+                };
+                if item.contains_key("file_id") {
+                    continue;
+                }
+                let Some(path) = item.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
+                item.insert(
+                    "file_id".to_owned(),
+                    json!(FileId::from_stable_parts(&[
+                        &repository_id.to_string(),
+                        path,
+                    ])),
+                );
+            }
+        }
+        let Ok(envelope) = serde_json::from_value::<RepositoryToolEnvelope>(value) else {
+            continue;
+        };
+        for item in envelope.evidence {
+            let _ = evidence.insert(item);
+        }
+    }
+    evidence
+}
+
+fn record_observable_message(
+    events: &dyn EventSink,
+    request_id: RequestId,
+    message: &ModelMessage,
+) {
+    events.emit(AppEvent::TaskTraceRecorded {
+        request_id,
+        event: WorkflowEvent::Message(serialized_trace_value(message)),
+    });
+}
+
+fn append_observable_message(
+    messages: &mut Vec<ModelMessage>,
+    message: ModelMessage,
+    events: &dyn EventSink,
+    request_id: RequestId,
+) {
+    record_observable_message(events, request_id, &message);
+    messages.push(message);
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TaskMeter {
+    next_sequence: u64,
+    usage: Option<TokenUsage>,
+}
+
+impl TaskMeter {
+    fn next_sequence(&mut self) -> u64 {
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence
+    }
+}
+
+fn stable_model_call_id(request_id: RequestId, sequence: u64) -> ModelCallId {
+    ModelCallId::from_stable_parts(&[&request_id.to_string(), &sequence.to_string()])
 }
 
 fn compact_redundant_tool_messages(request: &mut ModelRequest) -> bool {
@@ -772,27 +1203,38 @@ fn compact_redundant_tool_messages(request: &mut ModelRequest) -> bool {
     changed
 }
 
-fn compact_request_to_model_window(request: &mut ModelRequest, context_window_tokens: Option<u32>) {
+fn compact_request_to_model_window(
+    request: &mut ModelRequest,
+    context_window_tokens: Option<u32>,
+    protected_message_index: &mut usize,
+) {
     let Some(context_window_tokens) = context_window_tokens else {
         return;
     };
     let output_reserve = u64::from(context_window_tokens).div_ceil(4).max(1_024);
     let input_tokens = u64::from(context_window_tokens).saturating_sub(output_reserve);
     let target_bytes = usize::try_from(input_tokens.saturating_mul(3)).unwrap_or(usize::MAX);
-    compact_request_to_bytes(request, target_bytes);
+    compact_request_to_bytes(request, target_bytes, protected_message_index);
 }
 
-fn compact_request_after_overflow(request: &mut ModelRequest) -> bool {
+fn compact_request_after_overflow(
+    request: &mut ModelRequest,
+    protected_message_index: &mut usize,
+) -> bool {
     let current = request_size_bytes(request);
     let target = current.saturating_mul(2) / 3;
-    let mut changed = compact_request_to_bytes(request, target);
+    let mut changed = compact_request_to_bytes(request, target, protected_message_index);
     if request_size_bytes(request) > target {
         changed |= summarize_tool_results(request, target, false);
     }
     changed
 }
 
-fn compact_request_to_bytes(request: &mut ModelRequest, target_bytes: usize) -> bool {
+fn compact_request_to_bytes(
+    request: &mut ModelRequest,
+    target_bytes: usize,
+    protected_message_index: &mut usize,
+) -> bool {
     if request_size_bytes(request) <= target_bytes {
         return false;
     }
@@ -802,7 +1244,7 @@ fn compact_request_to_bytes(request: &mut ModelRequest, target_bytes: usize) -> 
         return changed;
     }
 
-    changed |= remove_old_conversation_turns(request, target_bytes);
+    changed |= remove_old_conversation_turns(request, target_bytes, protected_message_index);
     if request_size_bytes(request) <= target_bytes {
         return changed;
     }
@@ -810,16 +1252,26 @@ fn compact_request_to_bytes(request: &mut ModelRequest, target_bytes: usize) -> 
     changed | summarize_tool_results(request, target_bytes, true)
 }
 
-fn remove_old_conversation_turns(request: &mut ModelRequest, target_bytes: usize) -> bool {
-    let mut first_tool_message = request
-        .messages
-        .iter()
-        .position(|message| message.tool_call_id.is_some())
-        .unwrap_or(request.messages.len());
+fn remove_old_conversation_turns(
+    request: &mut ModelRequest,
+    target_bytes: usize,
+    protected_message_index: &mut usize,
+) -> bool {
     let mut changed = false;
-    while request_size_bytes(request) > target_bytes && first_tool_message > 3 {
-        request.messages.drain(1..3);
-        first_tool_message -= 2;
+    while request_size_bytes(request) > target_bytes && *protected_message_index > 1 {
+        let start = 1;
+        if request.messages[start].role != crate::ModelRole::User {
+            break;
+        }
+        let end = request.messages[start + 1..*protected_message_index]
+            .iter()
+            .position(|message| message.role == crate::ModelRole::User)
+            .map_or(*protected_message_index, |offset| start + 1 + offset);
+        if !message_group_is_protocol_complete(&request.messages[start..end]) {
+            break;
+        }
+        request.messages.drain(start..end);
+        *protected_message_index = protected_message_index.saturating_sub(end - start);
         changed = true;
     }
     if changed
@@ -833,6 +1285,19 @@ fn remove_old_conversation_turns(request: &mut ModelRequest, target_bytes: usize
         );
     }
     changed
+}
+
+fn message_group_is_protocol_complete(messages: &[ModelMessage]) -> bool {
+    let requested = messages
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .map(|call| call.id.as_str())
+        .collect::<HashSet<_>>();
+    let completed = messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect::<HashSet<_>>();
+    requested == completed
 }
 
 fn summarize_tool_results(
@@ -1110,6 +1575,23 @@ fn validate_config(config: &RuntimeConfig) -> Result<(), RuntimeConfigError> {
         pricing
             .validate()
             .map_err(RuntimeConfigError::InvalidPricing)?;
+    }
+    if config.budget.max_total_tokens == Some(0) {
+        return Err(RuntimeConfigError::ZeroTokenBudget);
+    }
+    if let Some(limit) = &config.budget.max_cost {
+        if limit.currency.trim().is_empty() || !limit.amount.is_finite() || limit.amount <= 0.0 {
+            return Err(RuntimeConfigError::InvalidMonetaryBudget);
+        }
+        let Some(pricing) = &config.pricing else {
+            return Err(RuntimeConfigError::MonetaryBudgetWithoutPricing);
+        };
+        if pricing.currency != limit.currency {
+            return Err(RuntimeConfigError::BudgetCurrencyMismatch {
+                pricing: pricing.currency.clone(),
+                budget: limit.currency.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -1467,17 +1949,50 @@ fn build_answer(
         .collect();
     let diagram = build_diagram_decision(&claims, structured_diagram)?;
     let evidence = retain_referenced_evidence(evidence, &claims, &call_paths, &diagram);
-    let answer = AgentAnswer {
+    let mut answer = AgentAnswer {
         id: answer_id,
         text,
         claims,
         evidence,
         call_paths,
         diagram,
+        suggested_actions: Vec::new(),
         usage,
     };
+    answer.suggested_actions = suggested_actions(&answer, request.profile);
     answer.validate_evidence()?;
     Ok(answer)
+}
+
+fn suggested_actions(answer: &AgentAnswer, profile: ExplanationProfile) -> Vec<SuggestedAction> {
+    let mut actions = Vec::with_capacity(4);
+    if let Some(claim) = answer
+        .claims
+        .iter()
+        .find(|claim| claim.kind == ClaimKind::Fact)
+        .or_else(|| answer.claims.first())
+    {
+        actions.push(SuggestedAction::DeepenClaim { claim_id: claim.id });
+    }
+    if let Some(path) = answer
+        .call_paths
+        .iter()
+        .find(|path| !path.complete)
+        .or_else(|| answer.call_paths.first())
+    {
+        actions.push(SuggestedAction::ContinueCallPath {
+            call_path_id: path.id,
+        });
+    }
+    if let Some(evidence) = answer.evidence.first() {
+        actions.push(SuggestedAction::ShowSource {
+            evidence_id: evidence.id,
+        });
+    }
+    if let Some(depth) = profile.depth.next() {
+        actions.push(SuggestedAction::ChangeDepth { depth });
+    }
+    actions
 }
 
 fn build_diagram_decision(
@@ -1636,6 +2151,43 @@ where
     }
 }
 
+async fn controlled_model_wait<F, T>(
+    future: F,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    timeout: Duration,
+    request_id: RequestId,
+    events: &dyn EventSink,
+) -> Result<T, RuntimeError>
+where
+    F: Future<Output = T>,
+{
+    let started = Instant::now();
+    let mut next_heartbeat = started + MODEL_WAIT_HEARTBEAT;
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(RuntimeError::Cancelled),
+            result = &mut future => return Ok(result),
+            () = tokio::time::sleep_until(deadline) => return Err(RuntimeError::Timeout {
+                limit: timeout,
+                operation: "waiting for a model response",
+            }),
+            () = tokio::time::sleep_until(next_heartbeat) => {
+                let elapsed = Instant::now().saturating_duration_since(started).as_secs();
+                emit_progress(
+                    events,
+                    request_id,
+                    ProgressPhase::Searching,
+                    &format!("waiting for model response ({elapsed}s elapsed)"),
+                );
+                next_heartbeat += MODEL_WAIT_HEARTBEAT;
+            }
+        }
+    }
+}
+
 fn ensure_active(
     cancellation: &CancellationToken,
     deadline: Instant,
@@ -1750,6 +2302,14 @@ pub enum RuntimeConfigError {
     InvalidToolSchema { name: String },
     #[error("invalid pricing: {0}")]
     InvalidPricing(#[source] PricingError),
+    #[error("model token budget must be greater than zero")]
+    ZeroTokenBudget,
+    #[error("model monetary budget must have a non-empty currency and a finite positive amount")]
+    InvalidMonetaryBudget,
+    #[error("a model monetary budget requires explicit model pricing")]
+    MonetaryBudgetWithoutPricing,
+    #[error("model pricing currency {pricing} does not match budget currency {budget}")]
+    BudgetCurrencyMismatch { pricing: String, budget: String },
 }
 
 #[derive(Debug, Error)]
@@ -1775,6 +2335,18 @@ pub enum RuntimeError {
         #[source]
         source: ModelError,
     },
+    #[error("agent token budget reached: used {used} tokens, limit {limit}")]
+    TokenBudgetExceeded { used: u64, limit: u64 },
+    #[error(
+        "agent monetary budget reached: used {used:.6} {currency}, limit {amount:.6} {currency}",
+        currency = .limit.currency,
+        amount = .limit.amount
+    )]
+    CostBudgetExceeded { used: f64, limit: MonetaryBudget },
+    #[error(
+        "model usage was omitted, so the configured token or monetary budget cannot be enforced"
+    )]
+    BudgetUnenforceable,
     #[error("model returned no tool calls in a tool-call turn")]
     EmptyToolCalls,
     #[error("submit_answer must be the only tool call in its model turn")]
@@ -1813,6 +2385,9 @@ impl RuntimeError {
             Self::Timeout { .. } => ("runtime_timeout", true),
             Self::Model(error) => ("model_error", error.is_retryable()),
             Self::ModelRetriesExhausted { source, .. } => ("model_error", source.is_retryable()),
+            Self::TokenBudgetExceeded { .. } => ("token_budget_exceeded", false),
+            Self::CostBudgetExceeded { .. } => ("cost_budget_exceeded", false),
+            Self::BudgetUnenforceable => ("budget_unenforceable", false),
             Self::EmptyToolCalls => ("empty_tool_calls", false),
             Self::MixedFinalAnswerToolCalls => ("mixed_final_answer_tool_calls", false),
             Self::InvalidFinalAnswer { .. } => ("invalid_final_answer", false),

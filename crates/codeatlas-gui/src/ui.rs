@@ -8,8 +8,9 @@ use std::{
 };
 
 use codeatlas_core::{
-    AppCommand, AppEvent, ClaimKind, DiagramDecision, DiagramKind, EntryPointKind, Language,
-    ModelUsage,
+    AppCommand, AppEvent, ClaimKind, DiagramDecision, DiagramKind, EntryPointKind,
+    ExplanationAudience, ExplanationDepth, ExplanationProfile, Language, ModelBudgetStatus,
+    ModelCallOutcome, ModelCallRecord, ModelUsage, SuggestedAction,
 };
 use eframe::egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use eframe::egui::{
@@ -443,7 +444,17 @@ impl GuiWindow {
             render_usage_summary(ui, usage);
             ui.add_space(8.0);
         }
-        let input_height = 102.0;
+        let model_calls = self
+            .state
+            .selected_model_calls()
+            .cloned()
+            .collect::<Vec<_>>();
+        let budget = self.state.selected_budget().cloned();
+        if !model_calls.is_empty() || budget.is_some() {
+            render_model_ledger(ui, &model_calls, budget.as_ref());
+            ui.add_space(8.0);
+        }
+        let input_height = 136.0;
         let conversation_height = (ui.available_height() - input_height).max(64.0);
         conversation_scroll_area(conversation_height).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -482,13 +493,29 @@ impl GuiWindow {
                             ui.add_space(12.0);
                             ui.label(RichText::new("CODEATLAS").small().strong().color(MUTED));
                             render_turn_answer(ui, &turn.answer_text, turn.status);
-                            turn.answer.as_ref().and_then(|answer| {
+                            let open_diagram = turn.answer.as_ref().and_then(|answer| {
                                 render_answer_details(ui, answer, diagram_message.as_deref())
-                            })
+                            });
+                            let action = (selected && turn.status == TurnStatus::Completed)
+                                .then(|| {
+                                    turn.answer.as_ref().and_then(|answer| {
+                                        render_suggested_actions(
+                                            ui,
+                                            answer,
+                                            self.state.can_ask(),
+                                        )
+                                    })
+                                })
+                                .flatten();
+                            (open_diagram, action)
                         });
-                    if let Some(diagram_id) = response.inner {
+                    if let Some(diagram_id) = response.inner.0 {
                         let command = self.state.open_diagram(diagram_id);
                         self.send(command);
+                    }
+                    if let Some(action) = response.inner.1 {
+                        let command = self.state.run_suggested_action(action);
+                        self.send_optional(command);
                     }
                     if response.response.interact(Sense::click()).clicked() {
                         self.state.select_task(turn.request_id);
@@ -503,6 +530,8 @@ impl GuiWindow {
     fn question_composer(&mut self, ui: &mut Ui) {
         ui.add_enabled_ui(self.state.can_ask(), |ui| {
             let input_events = ui.input(|input| input.events.clone());
+            profile_selectors(ui, &mut self.state.profile);
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let input = ui.add_sized(
                     [(ui.available_width() - 90.0).max(180.0), 62.0],
@@ -807,8 +836,16 @@ impl GuiWindow {
                                     ui.label(RichText::new(title).strong().color(TEXT));
                                     ui.label(
                                         RichText::new(format!(
-                                            "{} tasks | repository {} | {}",
+                                            "{} tasks | last: {} | {} / {} | repository {} | {}",
                                             session.tasks.len(),
+                                            session.tasks.last().map_or("empty", |task| match task.status {
+                                                codeatlas_core::SessionTaskStatus::Completed => "completed",
+                                                codeatlas_core::SessionTaskStatus::Failed => "failed",
+                                                codeatlas_core::SessionTaskStatus::Cancelled => "cancelled",
+                                                codeatlas_core::SessionTaskStatus::BudgetExceeded => "budget exceeded",
+                                            }),
+                                            session.tasks.last().map_or("Developer", |task| audience_label(task.profile.audience)),
+                                            session.tasks.last().map_or("Auto", |task| depth_label(task.profile.depth)),
                                             short_id(&session.repository_id),
                                             if current_repository { "can continue" } else { "read-only" }
                                         ))
@@ -1130,6 +1167,9 @@ fn render_turn_answer(ui: &mut Ui, text: &str, status: TurnStatus) {
                 RichText::new("The request failed before an answer was completed.").color(ERROR),
             );
         }
+        TurnStatus::BudgetExceeded => {
+            ui.label(RichText::new("The task stopped at its configured budget.").color(ERROR));
+        }
         TurnStatus::Running => {}
     }
 }
@@ -1139,6 +1179,72 @@ fn question_text_edit(input: &mut String) -> TextEdit<'_> {
         .hint_text("Ask how this codebase works...")
         .desired_rows(2)
         .return_key(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))
+}
+
+fn profile_selectors(ui: &mut Ui, profile: &mut ExplanationProfile) {
+    if ui.available_width() < 360.0 {
+        ui.horizontal(|ui| audience_selector(ui, &mut profile.audience));
+        ui.horizontal(|ui| depth_selector(ui, &mut profile.depth));
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        audience_selector(ui, &mut profile.audience);
+        depth_selector(ui, &mut profile.depth);
+    });
+}
+
+fn audience_selector(ui: &mut Ui, audience: &mut ExplanationAudience) {
+    ui.label(RichText::new("Audience").small().color(MUTED));
+    egui::ComboBox::from_id_salt("explanation_audience")
+        .width(92.0)
+        .selected_text(audience_label(*audience))
+        .show_ui(ui, |ui| {
+            for value in [
+                ExplanationAudience::Beginner,
+                ExplanationAudience::Developer,
+                ExplanationAudience::Expert,
+            ] {
+                ui.selectable_value(audience, value, audience_label(value));
+            }
+        });
+}
+
+fn depth_selector(ui: &mut Ui, depth: &mut ExplanationDepth) {
+    ui.label(RichText::new("Depth").small().color(MUTED));
+    egui::ComboBox::from_id_salt("explanation_depth")
+        .width(104.0)
+        .selected_text(depth_label(*depth))
+        .show_ui(ui, |ui| {
+            for value in [
+                ExplanationDepth::Auto,
+                ExplanationDepth::Overview,
+                ExplanationDepth::Architecture,
+                ExplanationDepth::Workflow,
+                ExplanationDepth::Code,
+                ExplanationDepth::Detail,
+            ] {
+                ui.selectable_value(depth, value, depth_label(value));
+            }
+        });
+}
+
+const fn audience_label(audience: ExplanationAudience) -> &'static str {
+    match audience {
+        ExplanationAudience::Beginner => "Beginner",
+        ExplanationAudience::Developer => "Developer",
+        ExplanationAudience::Expert => "Expert",
+    }
+}
+
+const fn depth_label(depth: ExplanationDepth) -> &'static str {
+    match depth {
+        ExplanationDepth::Auto => "Auto",
+        ExplanationDepth::Overview => "Overview",
+        ExplanationDepth::Architecture => "Architecture",
+        ExplanationDepth::Workflow => "Workflow",
+        ExplanationDepth::Code => "Code",
+        ExplanationDepth::Detail => "Detail",
+    }
 }
 
 fn is_plain_enter(event: &egui::Event) -> bool {
@@ -1709,6 +1815,38 @@ fn render_answer_details(
     open_diagram
 }
 
+fn render_suggested_actions(
+    ui: &mut Ui,
+    answer: &codeatlas_core::AgentAnswer,
+    enabled: bool,
+) -> Option<SuggestedAction> {
+    let actions = displayed_suggested_actions(answer);
+    if actions.len() == 0 {
+        return None;
+    }
+
+    let mut selected = None;
+    ui.add_space(12.0);
+    small_heading(ui, "NEXT STEPS");
+    ui.horizontal_wrapped(|ui| {
+        for action in actions {
+            if ui
+                .add_enabled(enabled, egui::Button::new(action.label()))
+                .clicked()
+            {
+                selected = Some(action);
+            }
+        }
+    });
+    selected
+}
+
+fn displayed_suggested_actions(
+    answer: &codeatlas_core::AgentAnswer,
+) -> impl ExactSizeIterator<Item = SuggestedAction> + '_ {
+    answer.suggested_actions.iter().copied().take(4)
+}
+
 fn workspace_side_panel_max_widths(viewport_width: f32) -> (f32, f32) {
     let expandable = (viewport_width
         - CONVERSATION_PANEL_MIN_WIDTH
@@ -1743,6 +1881,75 @@ fn render_usage_summary(ui: &mut Ui, usage: &ModelUsage) {
             ui.set_min_width(ui.available_width());
             small_heading(ui, "TOKEN USAGE");
             wrapped_label(ui, RichText::new(usage_summary(usage)).small().color(TEXT));
+        });
+}
+
+fn render_model_ledger(ui: &mut Ui, calls: &[ModelCallRecord], budget: Option<&ModelBudgetStatus>) {
+    Frame::new()
+        .fill(SURFACE_HIGH)
+        .corner_radius(4)
+        .inner_margin(Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("MODEL CALL LEDGER")
+                    .small()
+                    .strong()
+                    .color(MUTED),
+            );
+            if let Some(status) = budget {
+                let tokens = status.budget.max_total_tokens.map_or_else(
+                    || "tokens unlimited".to_owned(),
+                    |limit| format!("tokens {}/{}", status.usage.tokens.total_tokens, limit),
+                );
+                let cost = status.budget.max_cost.as_ref().map_or_else(
+                    || "cost unlimited".to_owned(),
+                    |limit| {
+                        format!(
+                            "cost {:.4}/{:.4} {}",
+                            status.usage.cost.as_ref().map_or(0.0, |cost| cost.amount),
+                            limit.amount,
+                            limit.currency
+                        )
+                    },
+                );
+                ui.label(
+                    RichText::new(format!("Budget: {tokens} | {cost}"))
+                        .small()
+                        .color(CYAN),
+                );
+            }
+            for call in calls {
+                let outcome = match &call.outcome {
+                    ModelCallOutcome::Succeeded => "success",
+                    ModelCallOutcome::Failed { .. } => "failed",
+                    ModelCallOutcome::Cancelled => "cancelled",
+                    ModelCallOutcome::TimedOut => "timed out",
+                };
+                let usage = call.usage.map_or_else(
+                    || "usage unavailable".to_owned(),
+                    |usage| {
+                        format!(
+                            "{} tokens (in {} / out {} / cached {})",
+                            usage.total_tokens,
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            usage.cached_input_tokens
+                        )
+                    },
+                );
+                let cost = call.cost.as_ref().map_or_else(String::new, |cost| {
+                    format!(" | ~{:.4} {}", cost.amount, cost.currency)
+                });
+                wrapped_label(
+                    ui,
+                    RichText::new(format!(
+                        "#{} {} | {} | {usage}{cost}",
+                        call.sequence, call.model, outcome
+                    ))
+                    .small()
+                    .color(TEXT),
+                );
+            }
         });
 }
 
@@ -1838,6 +2045,74 @@ mod tests {
                 viewport_width - repository - evidence
             );
         }
+    }
+
+    #[test]
+    fn compact_profile_and_action_controls_fit_a_narrow_conversation() {
+        let context = egui::Context::default();
+        let mut profile = ExplanationProfile::default();
+        let mut answer = AgentAnswer {
+            id: AnswerId::from_stable_parts(&["narrow-actions"]),
+            text: "Answer".to_owned(),
+            claims: Vec::new(),
+            evidence: Vec::new(),
+            call_paths: Vec::new(),
+            diagram: DiagramDecision::NotNeeded {
+                reason: "No diagram".to_owned(),
+            },
+            suggested_actions: vec![
+                SuggestedAction::ChangeDepth {
+                    depth: ExplanationDepth::Overview,
+                },
+                SuggestedAction::ChangeDepth {
+                    depth: ExplanationDepth::Architecture,
+                },
+                SuggestedAction::ChangeDepth {
+                    depth: ExplanationDepth::Workflow,
+                },
+                SuggestedAction::ChangeDepth {
+                    depth: ExplanationDepth::Code,
+                },
+                SuggestedAction::ChangeDepth {
+                    depth: ExplanationDepth::Detail,
+                },
+            ],
+            usage: None,
+        };
+        assert_eq!(displayed_suggested_actions(&answer).len(), 4);
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(320.0, 420.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let width = 270.0;
+                    let (content_right, limit) = ui
+                        .allocate_ui_with_layout(
+                            Vec2::new(width, 320.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                let limit = ui.max_rect().right();
+                                profile_selectors(ui, &mut profile);
+                                let _ = render_suggested_actions(ui, &answer, true);
+                                (ui.min_rect().right(), limit)
+                            },
+                        )
+                        .inner;
+                    assert!(
+                        content_right <= limit + 0.5,
+                        "controls exceeded narrow width: {content_right} > {limit}"
+                    );
+                });
+            },
+        );
+
+        answer.suggested_actions.clear();
+        assert_eq!(displayed_suggested_actions(&answer).len(), 0);
     }
 
     #[test]
@@ -2082,6 +2357,7 @@ mod tests {
                         diagram: DiagramDecision::NotNeeded {
                             reason: "The detail at the bottom remains reachable.".to_owned(),
                         },
+                        suggested_actions: Vec::new(),
                         usage: None,
                     };
                     let output = conversation_scroll_area(120.0).show(ui, |ui| {

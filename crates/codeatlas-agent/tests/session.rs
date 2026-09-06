@@ -6,11 +6,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use codeatlas_agent::{ModelPricing, SESSION_SCHEMA_VERSION, SessionState, SessionStore};
+use codeatlas_agent::{
+    ModelPricing, SESSION_SCHEMA_VERSION, SessionError, SessionState, SessionStore,
+};
 use codeatlas_core::{
-    AgentAnswer, AnswerId, Claim, ClaimId, ClaimKind, DiagramDecision, Evidence, EvidenceId,
-    FileId, ModelUsage, Progress, ProgressPhase, RepositoryId, RepositoryPath, RequestId,
-    SessionId, SourceSpan, TokenUsage, ToolCall, ToolCallId, WorkflowEvent,
+    AgentAnswer, AnswerId, Claim, ClaimId, ClaimKind, Cost, DiagramDecision, Evidence, EvidenceId,
+    ExplanationAudience, ExplanationDepth, ExplanationProfile, FileId, ModelUsage, Progress,
+    ProgressPhase, RepositoryId, RepositoryPath, RequestId, SessionId, SourceSpan, TokenUsage,
+    ToolCall, ToolCallId, WorkflowEvent,
 };
 
 fn evidence() -> Evidence {
@@ -40,6 +43,7 @@ fn answer() -> AgentAnswer {
         diagram: DiagramDecision::NotNeeded {
             reason: "A direct location answer does not need a diagram.".to_owned(),
         },
+        suggested_actions: Vec::new(),
         usage: Some(ModelUsage {
             tokens: TokenUsage {
                 input_tokens: 1_000_000,
@@ -105,11 +109,13 @@ fn successful_appends_update_only_the_updated_timestamp() {
 
     state.updated_at_unix_ms = 123;
     let before = current_unix_ms();
+    let mut workflow_answer = answer();
+    workflow_answer.id = AnswerId::from_stable_parts(&["workflow-append-timestamp-answer"]);
     state
         .append_turn_with_workflow(
             RequestId::from_stable_parts(&["workflow-append-timestamp-request"]),
             "How does run work?",
-            answer(),
+            workflow_answer,
             Vec::new(),
         )
         .expect("valid workflow turn");
@@ -117,6 +123,61 @@ fn successful_appends_update_only_the_updated_timestamp() {
 
     assert_eq!(state.created_at_unix_ms, 123);
     assert!((before..=after).contains(&state.updated_at_unix_ms));
+
+    let error = state
+        .append_turn(
+            RequestId::from_stable_parts(&["duplicate-answer-request"]),
+            "Duplicate answer ID",
+            answer(),
+        )
+        .expect_err("duplicate answer IDs must be rejected");
+    assert!(matches!(error, SessionError::DuplicateAnswer { .. }));
+}
+
+#[test]
+fn mixed_turn_currencies_keep_aggregate_cost_unavailable_after_later_appends() {
+    let directory = temporary_directory("mixed-currency");
+    let _ = fs::remove_dir_all(&directory);
+    let session_id = SessionId::from_stable_parts(&["mixed-currency-session"]);
+    let mut state = SessionState::new(
+        session_id,
+        RepositoryId::from_stable_parts(&["mixed-currency-repository"]),
+    );
+    for (label, currency) in [("eur", "EUR"), ("usd-1", "USD"), ("usd-2", "USD")] {
+        let mut turn_answer = answer();
+        turn_answer.id = AnswerId::from_stable_parts(&["mixed-currency", label, "answer"]);
+        turn_answer.usage = Some(ModelUsage {
+            tokens: TokenUsage::default(),
+            cost: Some(Cost {
+                currency: currency.to_owned(),
+                amount: 1.0,
+                estimated: true,
+            }),
+        });
+        state
+            .append_turn(
+                RequestId::from_stable_parts(&["mixed-currency", label]),
+                format!("question {label}"),
+                turn_answer,
+            )
+            .expect("mixed currencies must not reject a turn");
+    }
+
+    assert_eq!(state.turns.len(), 3);
+    assert!(state.usage.cost.is_none());
+    let store = SessionStore::new(&directory);
+    store
+        .save(&state)
+        .expect("mixed-currency session should save");
+    assert_eq!(
+        store
+            .load(session_id)
+            .expect("mixed-currency session should validate")
+            .usage
+            .cost,
+        None
+    );
+    fs::remove_dir_all(directory).expect("temporary directory cleanup");
 }
 
 #[test]
@@ -149,6 +210,8 @@ fn session_round_trips_atomically_with_history_usage_and_cost() {
     state
         .append_turn_with_workflow(request_id, "Where is run?", answer(), workflow.clone())
         .expect("valid turn");
+    state.turns[0].profile =
+        ExplanationProfile::new(ExplanationAudience::Expert, ExplanationDepth::Code);
     let pricing = ModelPricing {
         currency: "USD".to_owned(),
         input_per_million: 2.0,
@@ -163,7 +226,8 @@ fn session_round_trips_atomically_with_history_usage_and_cost() {
 
     assert_eq!(restored, state);
     assert_eq!(restored.schema_version, SESSION_SCHEMA_VERSION);
-    assert_eq!(restored.turns[0].workflow, workflow);
+    assert_eq!(restored.turns[0].trajectory, workflow);
+    assert_eq!(restored.turns[0].profile, state.turns[0].profile);
     assert_eq!(restored.conversation_history().len(), 2);
     assert_eq!(restored.usage.tokens.total_tokens, 1_500_000);
     let restored_cost = restored.usage.cost.as_ref().expect("estimated cost").amount;
@@ -195,6 +259,8 @@ fn legacy_session_json_without_workflow_loads_with_an_empty_trace() {
             answer(),
         )
         .expect("valid legacy turn");
+    state.turns[0].profile =
+        ExplanationProfile::new(ExplanationAudience::Beginner, ExplanationDepth::Overview);
     let mut encoded = serde_json::to_value(&state).expect("session should serialize");
     encoded["schema_version"] = serde_json::json!(1);
     encoded["turns"][0]
@@ -218,10 +284,99 @@ fn legacy_session_json_without_workflow_loads_with_an_empty_trace() {
 
     let restored = store.load(session_id).expect("legacy session should load");
     assert_eq!(restored.schema_version, SESSION_SCHEMA_VERSION);
-    assert!(restored.turns[0].workflow.is_empty());
+    assert!(restored.turns[0].trajectory.is_empty());
+    assert_eq!(restored.turns[0].profile, state.turns[0].profile);
     assert_eq!(restored.created_at_unix_ms, 0);
     assert_eq!(restored.updated_at_unix_ms, 0);
 
+    fs::remove_dir_all(directory).expect("temporary directory cleanup");
+}
+
+#[test]
+fn schema_three_task_without_profile_restores_the_default() {
+    let directory = temporary_directory("default-profile");
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).expect("session directory");
+    let session_id = SessionId::from_stable_parts(&["default-profile-session"]);
+    let mut state = SessionState::new(
+        session_id,
+        RepositoryId::from_stable_parts(&["default-profile-repository"]),
+    );
+    state
+        .append_turn(
+            RequestId::from_stable_parts(&["default-profile-request"]),
+            "Where is run?",
+            answer(),
+        )
+        .expect("valid turn");
+    let mut encoded = serde_json::to_value(state).expect("session should serialize");
+    encoded["turns"][0]
+        .as_object_mut()
+        .expect("turn should be an object")
+        .remove("profile");
+    let store = SessionStore::new(&directory);
+    fs::write(
+        store.session_path(session_id),
+        serde_json::to_vec_pretty(&encoded).expect("session JSON should serialize"),
+    )
+    .expect("session should be written");
+
+    let restored = store.load(session_id).expect("schema three should load");
+    assert_eq!(restored.turns[0].profile, ExplanationProfile::default());
+    fs::remove_dir_all(directory).expect("temporary directory cleanup");
+}
+
+#[test]
+fn schema_two_migrates_to_completed_schema_three_with_its_workflow() {
+    let directory = temporary_directory("schema-two-migration");
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).expect("session directory");
+    let session_id = SessionId::from_stable_parts(&["schema-two-session"]);
+    let repository_id = RepositoryId::from_stable_parts(&["schema-two-repository"]);
+    let request_id = RequestId::from_stable_parts(&["schema-two-request"]);
+    let workflow = vec![WorkflowEvent::Progress(Progress {
+        phase: ProgressPhase::Reading,
+        message: "legacy progress".to_owned(),
+        completed: None,
+        total: None,
+    })];
+    let legacy = serde_json::json!({
+        "schema_version": 2,
+        "session_id": session_id,
+        "repository_id": repository_id,
+        "turns": [{
+            "request_id": request_id,
+            "question": "legacy question",
+            "profile": {
+                "audience": "expert",
+                "depth": "architecture"
+            },
+            "answer": answer(),
+            "workflow": workflow,
+        }],
+        "usage": answer().usage.expect("fixture usage"),
+        "created_at_unix_ms": 100,
+        "updated_at_unix_ms": 200,
+    });
+    let store = SessionStore::new(&directory);
+    fs::write(
+        store.session_path(session_id),
+        serde_json::to_vec_pretty(&legacy).expect("legacy JSON should serialize"),
+    )
+    .expect("legacy session should be written");
+
+    let restored = store.load(session_id).expect("schema two should migrate");
+    assert_eq!(restored.schema_version, 3);
+    assert_eq!(
+        restored.turns[0].status,
+        codeatlas_core::SessionTaskStatus::Completed
+    );
+    assert_eq!(restored.turns[0].trajectory, workflow);
+    assert_eq!(
+        restored.turns[0].profile,
+        ExplanationProfile::new(ExplanationAudience::Expert, ExplanationDepth::Architecture,)
+    );
+    assert_eq!(restored.turns[0].continuation.len(), 2);
     fs::remove_dir_all(directory).expect("temporary directory cleanup");
 }
 
@@ -324,8 +479,32 @@ fn legacy_agent_answer_json_without_diagram_uses_the_core_default() {
 }
 
 #[test]
+fn lossy_session_load_reports_corrupt_files_and_keeps_valid_sessions() {
+    let directory = temporary_directory("lossy-load");
+    let _ = fs::remove_dir_all(&directory);
+    let store = SessionStore::new(&directory);
+    let session_id = SessionId::from_stable_parts(&["lossy-valid-session"]);
+    let state = SessionState::new(
+        session_id,
+        RepositoryId::from_stable_parts(&["lossy-repository"]),
+    );
+    store.save(&state).expect("valid session should save");
+    fs::write(directory.join("corrupt.json"), b"{not json")
+        .expect("corrupt session fixture should be written");
+
+    let (sessions, diagnostics) = store
+        .load_all_lossy()
+        .expect("directory-level load should succeed");
+
+    assert_eq!(sessions, vec![state]);
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].contains("corrupt.json"));
+    fs::remove_dir_all(directory).expect("temporary directory cleanup");
+}
+
+#[test]
 fn runtime_secret_debug_output_and_persisted_sessions_are_redacted() {
-    let secret_value = "sk-test-never-persist";
+    let secret_value = "test-secret-never-persist";
     let secret = codeatlas_agent::SecretString::new(secret_value);
     assert!(!format!("{secret:?}").contains(secret_value));
 

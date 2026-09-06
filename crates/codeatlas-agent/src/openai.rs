@@ -153,6 +153,8 @@ pub enum OpenAiClientBuildError {
     EmptyModel,
     #[error("model temperature must be finite")]
     NonFiniteTemperature,
+    #[error("model max output tokens must be greater than zero")]
+    ZeroMaxOutputTokens,
     #[error("request timeout must be greater than zero")]
     ZeroTimeout,
     #[error("invalid secret header name: {message}")]
@@ -205,6 +207,9 @@ impl OpenAiChatClient {
         if config.temperature.is_some_and(|value| !value.is_finite()) {
             return Err(OpenAiClientBuildError::NonFiniteTemperature);
         }
+        if config.max_output_tokens == Some(0) {
+            return Err(OpenAiClientBuildError::ZeroMaxOutputTokens);
+        }
         if timeout.is_zero() {
             return Err(OpenAiClientBuildError::ZeroTimeout);
         }
@@ -226,12 +231,27 @@ impl OpenAiChatClient {
                 message: "HTTP endpoint must include a host".to_owned(),
             });
         }
-        let http =
-            Client::builder()
-                .build()
-                .map_err(|error| OpenAiClientBuildError::HttpClient {
-                    message: secrets.redact(&error.to_string()),
-                })?;
+        if endpoint.scheme() == "http" && !is_local_http_endpoint(&endpoint) {
+            return Err(OpenAiClientBuildError::InvalidEndpoint {
+                endpoint: config.endpoint.clone(),
+                message: "remote model endpoints must use HTTPS; HTTP is allowed only for localhost, 127.0.0.1, or ::1".to_owned(),
+            });
+        }
+        let http = Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let endpoint = attempt.url();
+                let safe = endpoint.scheme() == "https"
+                    || (endpoint.scheme() == "http" && is_local_http_endpoint(endpoint));
+                if safe && attempt.previous().len() < 10 {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .build()
+            .map_err(|error| OpenAiClientBuildError::HttpClient {
+                message: secrets.redact(&error.to_string()),
+            })?;
         Ok(Self {
             config,
             endpoint,
@@ -247,6 +267,12 @@ impl OpenAiChatClient {
     }
 }
 
+fn is_local_http_endpoint(endpoint: &reqwest::Url) -> bool {
+    endpoint.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1" | "[::1]")
+    })
+}
+
 impl fmt::Debug for OpenAiChatClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -260,6 +286,10 @@ impl fmt::Debug for OpenAiChatClient {
 
 #[async_trait]
 impl ModelClient for OpenAiChatClient {
+    fn model_name(&self) -> &str {
+        &self.config.model
+    }
+
     fn context_window_tokens(&self) -> Option<u32> {
         self.config.context_window_tokens
     }
@@ -393,6 +423,10 @@ fn html_element_text(value: &str, element: &str) -> Option<String> {
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ChatTool>,
@@ -421,6 +455,8 @@ impl ChatRequest {
         let tool_choice = (!tools.is_empty()).then_some("auto");
         Ok(Self {
             model: config.model.clone(),
+            reasoning_mode: config.reasoning_mode.clone(),
+            reasoning_effort: config.reasoning_effort.clone(),
             messages,
             tools,
             tool_choice,

@@ -36,7 +36,9 @@ pub(crate) fn render_and_store(
     data_directory: &Path,
     repository_root: &Path,
     answer: &mut AgentAnswer,
+    cancellation: &dyn Fn() -> bool,
 ) -> Result<(), DiagramGenerationError> {
+    ensure_active(cancellation)?;
     let answer_id = answer.id;
     let DiagramDecision::Needed { diagram, .. } = &mut answer.diagram else {
         return Ok(());
@@ -53,9 +55,25 @@ pub(crate) fn render_and_store(
         canonical_json.as_str(),
     ]);
     let svg = render_svg(&identity_diagram).map_err(DiagramGenerationError::Render)?;
-    let artifact = store_svg(data_directory, repository_root, answer_id, diagram_id, &svg)?;
+    ensure_active(cancellation)?;
+    let artifact = store_svg(
+        data_directory,
+        repository_root,
+        answer_id,
+        diagram_id,
+        &svg,
+        cancellation,
+    )?;
     diagram.artifact = Some(artifact);
     Ok(())
+}
+
+fn ensure_active(cancellation: &dyn Fn() -> bool) -> Result<(), DiagramGenerationError> {
+    if cancellation() {
+        Err(DiagramGenerationError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn open_in_default_viewer(
@@ -207,12 +225,14 @@ fn store_svg(
     answer_id: AnswerId,
     diagram_id: DiagramId,
     svg: &[u8],
+    cancellation: &dyn Fn() -> bool,
 ) -> Result<DiagramArtifact, DiagramGenerationError> {
     let data_directory = canonical_directory(configured_data_directory, "resolve data directory")?;
     let repository_root = canonical_directory(repository_root, "resolve repository root")?;
     if data_directory.starts_with(&repository_root) {
         return Err(DiagramGenerationError::DataDirectoryInRepository);
     }
+    ensure_active(cancellation)?;
 
     let diagrams_directory = prepare_managed_directory(
         &data_directory.join("diagrams"),
@@ -237,6 +257,7 @@ fn store_svg(
     let _store_guard = STORE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ensure_active(cancellation)?;
     let canonical_target = match existing_target(&target, &answer_directory, svg)? {
         Some(path) => path,
         None => persist_new_target(
@@ -511,6 +532,8 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 
 #[derive(Debug, Error)]
 pub(crate) enum DiagramGenerationError {
+    #[error("diagram generation was cancelled")]
+    Cancelled,
     #[error("diagram identity serialization failed")]
     Serialize(#[source] serde_json::Error),
     #[error("diagram rendering failed")]

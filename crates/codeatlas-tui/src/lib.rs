@@ -12,8 +12,8 @@ mod terminal;
 
 pub use app::{
     Activity, AnswerView, ConversationEntry, EvidenceViewer, HistoryView, InputMode, LayoutMode,
-    Panel, ProgressTrace, RepositoryView, RequestKind, ToolTrace, ToolTraceStatus, TuiApp,
-    TuiSnapshot, UiError, UiPreferences,
+    Panel, ProfileField, ProfileSettings, ProgressTrace, RepositoryView, RequestKind,
+    SuggestedActionMenu, ToolTrace, ToolTraceStatus, TuiApp, TuiSnapshot, UiError, UiPreferences,
 };
 pub use port::{ApplicationPort, ChannelApplicationPort, ChannelPortError};
 pub use terminal::{TuiError, run_tui};

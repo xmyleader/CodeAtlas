@@ -42,6 +42,7 @@ const MAX_TRACE_DEPTH: u32 = 20;
 const DEFAULT_TRACE_NODES: usize = 100;
 const MAX_TRACE_NODES: usize = 1_000;
 const MAX_TRACE_EDGES: usize = 4_000;
+const SOURCE_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 type FilesById = BTreeMap<FileId, usize>;
 type FilesByPath = BTreeMap<RepositoryPath, FileId>;
@@ -470,6 +471,20 @@ impl RepositoryIndex {
         &self,
         query: &SearchCodeQuery,
     ) -> Result<QueryResponse<SearchCodeResult>, QueryError> {
+        self.search_code_cancellable(query, &|| false)
+    }
+
+    /// Performs bounded literal source search with cooperative cancellation
+    /// between files, source-read chunks, and source lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError`] for invalid input, unsafe paths, or cancellation.
+    pub fn search_code_cancellable(
+        &self,
+        query: &SearchCodeQuery,
+        cancellation: &dyn Fn() -> bool,
+    ) -> Result<QueryResponse<SearchCodeResult>, QueryError> {
         validate_search_term(&query.query)?;
         let limit = result_limit(query.limit)?;
         let case_sensitive = query.case_sensitive.unwrap_or(true);
@@ -481,7 +496,8 @@ impl RepositoryIndex {
                 .as_ref()
                 .is_none_or(|prefix| path_has_prefix(&file.path, prefix))
         }) {
-            let source = match self.read_source(&file.path) {
+            ensure_query_active(cancellation)?;
+            let source = match self.read_source_cancellable(&file.path, cancellation) {
                 Ok(source) => source,
                 Err(error @ (QueryError::PathEscape { .. } | QueryError::NotAFile { .. })) => {
                     return Err(error);
@@ -498,6 +514,7 @@ impl RepositoryIndex {
                 query,
                 case_sensitive,
                 &mut state,
+                cancellation,
             )?;
             if state.truncated {
                 break;
@@ -1550,6 +1567,15 @@ impl RepositoryIndex {
     }
 
     fn read_source(&self, path: &RepositoryPath) -> Result<String, QueryError> {
+        self.read_source_cancellable(path, &|| false)
+    }
+
+    fn read_source_cancellable(
+        &self,
+        path: &RepositoryPath,
+        cancellation: &dyn Fn() -> bool,
+    ) -> Result<String, QueryError> {
+        ensure_query_active(cancellation)?;
         self.indexed_file_id(path)?;
         let joined = self.root.join(path.as_str());
         let canonical = fs::canonicalize(&joined).map_err(|error| QueryError::FileRead {
@@ -1576,17 +1602,32 @@ impl RepositoryIndex {
                 limit_bytes: MAX_SOURCE_BYTES,
             });
         }
-        let file = File::open(&canonical).map_err(|error| QueryError::FileRead {
+        let mut file = File::open(&canonical).map_err(|error| QueryError::FileRead {
             path: path.to_string(),
             message: error.to_string(),
         })?;
         let mut bytes = Vec::new();
-        file.take(MAX_SOURCE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| QueryError::FileRead {
-                path: path.to_string(),
-                message: error.to_string(),
-            })?;
+        let mut chunk = vec![0_u8; SOURCE_READ_CHUNK_BYTES];
+        loop {
+            ensure_query_active(cancellation)?;
+            let remaining = MAX_SOURCE_BYTES
+                .saturating_add(1)
+                .saturating_sub(bytes.len());
+            if remaining == 0 {
+                break;
+            }
+            let limit = remaining.min(chunk.len());
+            let read = file
+                .read(&mut chunk[..limit])
+                .map_err(|error| QueryError::FileRead {
+                    path: path.to_string(),
+                    message: error.to_string(),
+                })?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
         if bytes.len() > MAX_SOURCE_BYTES {
             return Err(QueryError::FileTooLarge {
                 path: path.to_string(),
@@ -1932,6 +1973,7 @@ fn normalize_evidence(mut evidence: Vec<Evidence>) -> Vec<Evidence> {
 }
 
 impl RepositoryIndex {
+    #[allow(clippy::too_many_arguments)]
     fn search_file(
         &self,
         file_id: FileId,
@@ -1940,8 +1982,10 @@ impl RepositoryIndex {
         query: &SearchCodeQuery,
         case_sensitive: bool,
         state: &mut SearchState,
+        cancellation: &dyn Fn() -> bool,
     ) -> Result<(), QueryError> {
         for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
+            ensure_query_active(cancellation)?;
             let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
             let line = line.strip_suffix('\r').unwrap_or(line);
             let offsets =
@@ -1971,6 +2015,14 @@ impl RepositoryIndex {
                     .push(self.make_evidence(file_id, span, None, Some(&excerpt)));
             }
         }
+        Ok(())
+    }
+}
+
+fn ensure_query_active(cancellation: &dyn Fn() -> bool) -> Result<(), QueryError> {
+    if cancellation() {
+        Err(QueryError::Cancelled)
+    } else {
         Ok(())
     }
 }

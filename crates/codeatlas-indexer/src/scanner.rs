@@ -14,6 +14,9 @@ use thiserror::Error;
 use crate::{DiagnosticSeverity, DiagnosticStage, FileDiagnostic};
 
 const FINGERPRINT_DOMAIN: &[u8] = b"codeatlas-scan-fingerprint-v1";
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+pub type CancellationCheck<'a> = dyn Fn() -> bool + Send + Sync + 'a;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanConfig {
@@ -65,6 +68,8 @@ pub enum ScanError {
     ResolveRoot { path: PathBuf, source: io::Error },
     #[error("repository root is not a directory: {0}")]
     NotDirectory(PathBuf),
+    #[error("repository scan was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -90,6 +95,22 @@ impl RepositoryScanner {
     /// Returns [`ScanError`] when the root cannot be resolved or is not a directory.
     #[allow(clippy::too_many_lines)]
     pub fn scan(&self, root: impl AsRef<Path>) -> Result<ScanResult, ScanError> {
+        self.scan_cancellable(root, None)
+    }
+
+    /// Scans one local repository with cooperative cancellation between
+    /// traversal, file-read, and fingerprinting work units.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScanError`] when the root is invalid or cancellation is requested.
+    #[allow(clippy::too_many_lines)]
+    pub fn scan_cancellable(
+        &self,
+        root: impl AsRef<Path>,
+        cancellation: Option<&CancellationCheck<'_>>,
+    ) -> Result<ScanResult, ScanError> {
+        ensure_active(cancellation)?;
         let requested_root = root.as_ref();
         let root = fs::canonicalize(requested_root).map_err(|source| ScanError::ResolveRoot {
             path: requested_root.to_path_buf(),
@@ -126,6 +147,7 @@ impl RepositoryScanner {
         let mut file_limit_reported = false;
 
         for (visited_entries, entry) in builder.build().enumerate() {
+            ensure_active(cancellation)?;
             if visited_entries >= self.config.max_entries {
                 skipped_files = skipped_files.saturating_add(1);
                 diagnostics.push(FileDiagnostic::new(
@@ -250,7 +272,7 @@ impl RepositoryScanner {
             }
 
             let modified = modified_parts(metadata.modified().ok());
-            let bytes = match read_bounded(entry.path(), self.config.max_file_size) {
+            let bytes = match read_bounded(entry.path(), self.config.max_file_size, cancellation) {
                 Ok(bytes) => bytes,
                 Err(ReadBoundedError::TooLarge) => {
                     skipped_files = skipped_files.saturating_add(1);
@@ -270,6 +292,7 @@ impl RepositoryScanner {
                     ));
                     continue;
                 }
+                Err(ReadBoundedError::Cancelled) => return Err(ScanError::Cancelled),
             };
             let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             if total_bytes
@@ -321,7 +344,8 @@ impl RepositoryScanner {
 
         files.sort_by(|left, right| left.path.cmp(&right.path));
         diagnostics.sort_by(diagnostic_order);
-        let fingerprint = fingerprint(&self.config, &files);
+        ensure_active(cancellation)?;
+        let fingerprint = fingerprint(&self.config, &files, cancellation)?;
         Ok(ScanResult {
             files,
             skipped_files,
@@ -341,14 +365,38 @@ impl Default for RepositoryScanner {
 enum ReadBoundedError {
     TooLarge,
     Io(io::Error),
+    Cancelled,
 }
 
-fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ReadBoundedError> {
-    let file = File::open(path).map_err(ReadBoundedError::Io)?;
+fn read_bounded(
+    path: &Path,
+    max_bytes: u64,
+    cancellation: Option<&CancellationCheck<'_>>,
+) -> Result<Vec<u8>, ReadBoundedError> {
+    let mut file = File::open(path).map_err(ReadBoundedError::Io)?;
     let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(ReadBoundedError::Io)?;
+    let mut chunk = vec![0_u8; READ_CHUNK_BYTES];
+    loop {
+        if cancellation.is_some_and(|check| check()) {
+            return Err(ReadBoundedError::Cancelled);
+        }
+        let remaining = max_bytes
+            .saturating_add(1)
+            .saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if remaining == 0 {
+            break;
+        }
+        let limit = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(chunk.len());
+        let read = file
+            .read(&mut chunk[..limit])
+            .map_err(ReadBoundedError::Io)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(ReadBoundedError::TooLarge);
     }
@@ -392,7 +440,11 @@ fn modified_parts(modified: Option<SystemTime>) -> Option<(u64, u32)> {
     Some((duration.as_secs(), duration.subsec_nanos()))
 }
 
-fn fingerprint(config: &ScanConfig, files: &[ScannedFile]) -> String {
+fn fingerprint(
+    config: &ScanConfig,
+    files: &[ScannedFile],
+    cancellation: Option<&CancellationCheck<'_>>,
+) -> Result<String, ScanError> {
     let mut hasher = Sha256::new();
     hasher.update(FINGERPRINT_DOMAIN);
     hash_u64(&mut hasher, config.max_file_size);
@@ -414,9 +466,11 @@ fn fingerprint(config: &ScanConfig, files: &[ScannedFile]) -> String {
         u64::try_from(config.binary_probe_bytes).unwrap_or(u64::MAX),
     );
     for directory in &config.excluded_directories {
+        ensure_active(cancellation)?;
         hash_bytes(&mut hasher, directory.as_bytes());
     }
     for file in files {
+        ensure_active(cancellation)?;
         hash_bytes(&mut hasher, file.path.as_str().as_bytes());
         hash_bytes(&mut hasher, language_key(&file.language).as_bytes());
         match file.modified {
@@ -429,7 +483,15 @@ fn fingerprint(config: &ScanConfig, files: &[ScannedFile]) -> String {
         }
         hash_bytes(&mut hasher, file.source.as_bytes());
     }
-    hex_digest(hasher.finalize().as_slice())
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn ensure_active(cancellation: Option<&CancellationCheck<'_>>) -> Result<(), ScanError> {
+    if cancellation.is_some_and(|check| check()) {
+        Err(ScanError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn language_key(language: &Language) -> String {

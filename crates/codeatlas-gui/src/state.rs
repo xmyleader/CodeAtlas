@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 
 use codeatlas_core::{
     AgentAnswer, AppCommand, AppError, AppEvent, Claim, ClaimId, DiagramId, Evidence, EvidenceId,
-    ModelUsage, Progress, ProgressPhase, RepositoryId, RepositoryMap, RepositoryPath, RequestId,
-    SessionContext, SessionId, SessionSummary, TargetResolution, ToolCallId, WorkflowEvent,
+    ExplanationProfile, ModelBudgetStatus, ModelCallRecord, ModelUsage, Progress, ProgressPhase,
+    RepositoryId, RepositoryMap, RepositoryPath, RequestId, SessionContext, SessionId,
+    SessionSummary, SessionTaskStatus, SuggestedAction, TargetResolution, ToolCallId,
+    WorkflowEvent,
 };
 
 const MAX_PROGRESS_ITEMS_PER_REQUEST: usize = 48;
@@ -61,6 +63,7 @@ pub struct RepositoryView {
 pub struct TurnView {
     pub request_id: RequestId,
     pub question: String,
+    pub profile: ExplanationProfile,
     pub answer_text: String,
     pub answer: Option<AgentAnswer>,
     pub status: TurnStatus,
@@ -72,6 +75,16 @@ pub enum TurnStatus {
     Completed,
     Cancelled,
     Failed,
+    BudgetExceeded,
+}
+
+const fn task_status_label(status: SessionTaskStatus) -> &'static str {
+    match status {
+        SessionTaskStatus::Completed => "Completed",
+        SessionTaskStatus::Failed => "Failed",
+        SessionTaskStatus::Cancelled => "Cancelled",
+        SessionTaskStatus::BudgetExceeded => "Budget exceeded",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +157,7 @@ pub struct GuiState {
     next_session: u64,
     pub repository_input: String,
     pub question_input: String,
+    pub profile: ExplanationProfile,
     pub repository: Option<RepositoryView>,
     pub status: WorkStatus,
     pub panel: WorkspacePanel,
@@ -169,6 +183,8 @@ pub struct GuiState {
     pending_session: Option<RequestId>,
     pending_diagrams: BTreeMap<RequestId, DiagramId>,
     usage: BTreeMap<RequestId, ModelUsage>,
+    model_calls: Vec<(RequestId, ModelCallRecord)>,
+    budgets: BTreeMap<RequestId, ModelBudgetStatus>,
 }
 
 impl GuiState {
@@ -182,6 +198,7 @@ impl GuiState {
             next_session: 0,
             repository_input: String::new(),
             question_input: String::new(),
+            profile: ExplanationProfile::default(),
             repository: None,
             status: WorkStatus::Idle,
             panel: WorkspacePanel::Conversation,
@@ -207,6 +224,8 @@ impl GuiState {
             pending_session: None,
             pending_diagrams: BTreeMap::new(),
             usage: BTreeMap::new(),
+            model_calls: Vec::new(),
+            budgets: BTreeMap::new(),
         }
     }
 
@@ -256,6 +275,25 @@ impl GuiState {
                 .as_ref()
                 .and_then(|answer| answer.usage.as_ref())
         })
+    }
+
+    pub fn selected_model_calls(&self) -> impl Iterator<Item = &ModelCallRecord> {
+        let selected = self.selected_turn().map(|turn| turn.request_id);
+        self.model_calls
+            .iter()
+            .filter_map(move |(request_id, record)| {
+                selected
+                    .is_none_or(|selected| selected == *request_id)
+                    .then_some(record)
+            })
+    }
+
+    #[must_use]
+    pub fn selected_budget(&self) -> Option<&ModelBudgetStatus> {
+        match self.selected_task {
+            Some(request_id) => self.budgets.get(&request_id),
+            None => self.budgets.values().next_back(),
+        }
     }
 
     #[must_use]
@@ -347,6 +385,7 @@ impl GuiState {
         self.turns.push(TurnView {
             request_id,
             question: question.clone(),
+            profile: self.profile,
             answer_text: String::new(),
             answer: None,
             status: TurnStatus::Running,
@@ -368,7 +407,144 @@ impl GuiState {
             session_id: self.session_id,
             repository_id,
             question,
+            profile: self.profile,
         })
+    }
+
+    #[must_use]
+    pub fn run_suggested_action(&mut self, action: SuggestedAction) -> Option<AppCommand> {
+        if self.active.is_some() {
+            self.local_error(
+                "busy",
+                "Cancel the current work before running a suggested action.",
+            );
+            return None;
+        }
+        let Some(repository_id) = self.repository.as_ref().map(|repository| repository.id) else {
+            self.local_error(
+                "repository_not_indexed",
+                "Index this session's repository before running a suggested action.",
+            );
+            return None;
+        };
+        if self.is_read_only() {
+            self.local_error(
+                "session_repository_mismatch",
+                "This session is read-only because it belongs to another repository.",
+            );
+            return None;
+        }
+        let Some((answer_id, turn_profile, offered, evidence)) =
+            self.selected_turn().and_then(|turn| {
+                let answer = turn.answer.as_ref()?;
+                Some((
+                    answer.id,
+                    turn.profile,
+                    answer.suggested_actions.contains(&action),
+                    match action {
+                        SuggestedAction::ShowSource { evidence_id } => answer
+                            .evidence
+                            .iter()
+                            .find(|evidence| evidence.id == evidence_id)
+                            .cloned(),
+                        _ => None,
+                    },
+                ))
+            })
+        else {
+            self.local_error(
+                "suggested_action_unavailable",
+                "Select a completed answer before running a suggested action.",
+            );
+            return None;
+        };
+        if !offered {
+            self.local_error(
+                "suggested_action_unavailable",
+                "This action is not offered by the selected answer.",
+            );
+            return None;
+        }
+
+        let request_id = self.next_request_id("suggested-action");
+        if let SuggestedAction::ShowSource { .. } = action {
+            let Some(evidence) = evidence else {
+                self.local_error(
+                    "suggested_action_unavailable",
+                    "The source evidence is not present in the selected answer.",
+                );
+                return None;
+            };
+            self.start_suggested_source(request_id, repository_id, evidence);
+        } else {
+            self.start_suggested_follow_up(request_id, turn_profile, action);
+        }
+        self.error = None;
+
+        Some(AppCommand::RunSuggestedAction {
+            request_id,
+            session_id: self.session_id,
+            repository_id,
+            answer_id,
+            action,
+        })
+    }
+
+    fn start_suggested_source(
+        &mut self,
+        request_id: RequestId,
+        repository_id: RepositoryId,
+        evidence: Evidence,
+    ) {
+        let (start_line, end_line) = evidence_line_range(&evidence);
+        self.selected_claim = None;
+        self.selected_evidence = Some(evidence.id);
+        self.source = Some(SourceView {
+            evidence_id: evidence.id,
+            path: evidence.path,
+            start_line,
+            end_line,
+            content: evidence.excerpt.unwrap_or_default(),
+            status: SourceStatus::Loading,
+            message: None,
+            pending_request: Some(request_id),
+            repository_id: Some(repository_id),
+        });
+        self.panel = WorkspacePanel::Evidence;
+    }
+
+    fn start_suggested_follow_up(
+        &mut self,
+        request_id: RequestId,
+        turn_profile: ExplanationProfile,
+        action: SuggestedAction,
+    ) {
+        let profile = match action {
+            SuggestedAction::ChangeDepth { depth } => ExplanationProfile {
+                depth,
+                ..turn_profile
+            },
+            _ => turn_profile,
+        };
+        self.profile = profile;
+        self.turns.push(TurnView {
+            request_id,
+            question: action.label().to_owned(),
+            profile,
+            answer_text: String::new(),
+            answer: None,
+            status: TurnStatus::Running,
+        });
+        self.selected_task = Some(request_id);
+        self.selected_claim = None;
+        self.selected_evidence = None;
+        self.source = None;
+        self.active = Some(ActiveRequest {
+            id: request_id,
+            kind: RequestKind::Ask,
+            cancel_id: None,
+        });
+        self.status = WorkStatus::Thinking;
     }
 
     #[must_use]
@@ -442,8 +618,14 @@ impl GuiState {
     }
 
     pub fn select_task(&mut self, request_id: RequestId) {
-        if self.turns.iter().any(|turn| turn.request_id == request_id) {
+        if let Some(profile) = self
+            .turns
+            .iter()
+            .find(|turn| turn.request_id == request_id)
+            .map(|turn| turn.profile)
+        {
             self.selected_task = Some(request_id);
+            self.profile = profile;
             self.selected_claim = None;
             self.selected_evidence = None;
             self.source = None;
@@ -572,7 +754,7 @@ impl GuiState {
                 }
             }
             // Candidate evidence is exploratory. Only AnswerCompleted carries verified final evidence.
-            AppEvent::EvidenceAdded { .. } => {}
+            AppEvent::EvidenceAdded { .. } | AppEvent::TaskTraceRecorded { .. } => {}
             AppEvent::AnswerDelta { request_id, delta } => {
                 if self.active_is(request_id, RequestKind::Ask) {
                     if let Some(turn) = self.turn_mut(request_id) {
@@ -586,6 +768,13 @@ impl GuiState {
             AppEvent::UsageUpdated { request_id, usage } => {
                 self.reduce_usage_updated(request_id, usage);
             }
+            AppEvent::ModelCallRecorded { request_id, record } => {
+                self.model_calls.push((request_id, record));
+            }
+            AppEvent::BudgetUpdated { request_id, status }
+            | AppEvent::BudgetExceeded {
+                request_id, status, ..
+            } => self.reduce_budget(request_id, status),
             AppEvent::IndexCompleted {
                 request_id,
                 repository_id,
@@ -798,6 +987,10 @@ impl GuiState {
         self.usage.insert(request_id, usage);
     }
 
+    fn reduce_budget(&mut self, request_id: RequestId, status: ModelBudgetStatus) {
+        self.budgets.insert(request_id, status);
+    }
+
     fn reduce_index_completed(
         &mut self,
         request_id: RequestId,
@@ -887,30 +1080,76 @@ impl GuiState {
         self.clear_session();
         self.session_id = session.session_id;
         self.session_repository_id = Some(session.repository_id);
+        let latest_status = session.tasks.last().map(|task| task.status);
         for task in session.tasks {
             let task_request = task.request_id;
-            for event in &task.workflow {
+            for event in &task.trajectory {
                 self.restore_activity(task_request, event);
             }
-            self.finish_running_activity(task_request, ActivityStatus::Complete);
-            if let Some(usage) = task.answer.usage.clone() {
+            let activity_status = match task.status {
+                SessionTaskStatus::Completed => ActivityStatus::Complete,
+                SessionTaskStatus::Cancelled => ActivityStatus::Cancelled,
+                SessionTaskStatus::Failed | SessionTaskStatus::BudgetExceeded => {
+                    ActivityStatus::Failed
+                }
+            };
+            self.finish_running_activity(task_request, activity_status);
+            if let Some(usage) = task.usage.clone() {
                 self.usage.insert(task_request, usage);
             }
+            self.model_calls.extend(
+                task.model_calls
+                    .into_iter()
+                    .map(|record| (task_request, record)),
+            );
+            if let Some(budget) = task.budget {
+                self.budgets.insert(task_request, budget);
+            }
+            let status = match task.status {
+                SessionTaskStatus::Completed => TurnStatus::Completed,
+                SessionTaskStatus::Cancelled => TurnStatus::Cancelled,
+                SessionTaskStatus::Failed => TurnStatus::Failed,
+                SessionTaskStatus::BudgetExceeded => TurnStatus::BudgetExceeded,
+            };
+            let answer_text = task.answer.as_ref().map_or_else(
+                || {
+                    task.terminal_error.as_ref().map_or_else(
+                        || task_status_label(task.status).to_owned(),
+                        |error| error.message.clone(),
+                    )
+                },
+                |answer| answer.text.clone(),
+            );
             self.turns.push(TurnView {
                 request_id: task_request,
                 question: task.question,
-                answer_text: task.answer.text.clone(),
-                answer: Some(task.answer),
-                status: TurnStatus::Completed,
+                profile: task.profile,
+                answer_text,
+                answer: task.answer,
+                status,
             });
-            self.outcomes
-                .insert(task_request, RequestOutcome::Completed);
+            self.outcomes.insert(
+                task_request,
+                match task.status {
+                    SessionTaskStatus::Completed => RequestOutcome::Completed,
+                    SessionTaskStatus::Cancelled => RequestOutcome::Cancelled,
+                    SessionTaskStatus::Failed | SessionTaskStatus::BudgetExceeded => {
+                        RequestOutcome::Failed
+                    }
+                },
+            );
         }
         self.selected_task = self.turns.last().map(|turn| turn.request_id);
-        self.status = if self.turns.is_empty() {
-            WorkStatus::Indexed
-        } else {
-            WorkStatus::AnswerReady
+        if let Some(profile) = self.turns.last().map(|turn| turn.profile) {
+            self.profile = profile;
+        }
+        self.status = match latest_status {
+            None => WorkStatus::Indexed,
+            Some(SessionTaskStatus::Completed) => WorkStatus::AnswerReady,
+            Some(SessionTaskStatus::Cancelled) => WorkStatus::Cancelled,
+            Some(SessionTaskStatus::Failed | SessionTaskStatus::BudgetExceeded) => {
+                WorkStatus::Error
+            }
         };
         self.history_loading = false;
         self.history_open = false;
@@ -933,6 +1172,17 @@ impl GuiState {
             WorkflowEvent::ToolCallCompleted {
                 call_id, is_error, ..
             } => self.complete_tool(request_id, *call_id, *is_error),
+            WorkflowEvent::ModelCall(_)
+            | WorkflowEvent::Message(_)
+            | WorkflowEvent::ModelRequest { .. }
+            | WorkflowEvent::ModelResponse { .. }
+            | WorkflowEvent::ModelError { .. } => {}
+            WorkflowEvent::Usage(usage) => {
+                self.usage.insert(request_id, usage.clone());
+            }
+            WorkflowEvent::BudgetUpdated(status) | WorkflowEvent::BudgetExceeded { status, .. } => {
+                self.budgets.insert(request_id, status.clone());
+            }
         }
     }
 
@@ -1032,6 +1282,8 @@ impl GuiState {
         self.activity.clear();
         self.outcomes.clear();
         self.usage.clear();
+        self.model_calls.clear();
+        self.budgets.clear();
         self.notices.clear();
         self.diagram_messages.clear();
     }
@@ -1166,9 +1418,69 @@ fn human_tool_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use codeatlas_core::{AnswerId, ClaimKind, DiagramDecision, FileId, SourceSpan, TokenUsage};
+    use codeatlas_core::{
+        AnswerId, ClaimKind, DiagramDecision, FileId, ModelBudget, ModelBudgetStatus, ModelCallId,
+        ModelCallOutcome, ModelCallRecord, SourceSpan, TokenUsage,
+    };
 
     use super::*;
+
+    #[test]
+    fn reducer_keeps_model_call_ledger_and_budget_status() {
+        let mut state = GuiState::new("model-cost-controls");
+        let request_id = RequestId::from_stable_parts(&["model-cost-controls"]);
+        let usage = TokenUsage {
+            input_tokens: 8,
+            output_tokens: 2,
+            cached_input_tokens: 3,
+            total_tokens: 10,
+        };
+        state.reduce(AppEvent::ModelCallRecorded {
+            request_id,
+            record: ModelCallRecord {
+                id: ModelCallId::from_stable_parts(&["model-cost-controls", "1"]),
+                sequence: 1,
+                model: "test-model".to_owned(),
+                outcome: ModelCallOutcome::Succeeded,
+                usage: Some(usage),
+                cost: None,
+            },
+        });
+        state.reduce(AppEvent::BudgetUpdated {
+            request_id,
+            status: ModelBudgetStatus {
+                budget: ModelBudget {
+                    max_total_tokens: Some(100),
+                    max_cost: None,
+                },
+                usage: ModelUsage {
+                    tokens: usage,
+                    cost: None,
+                },
+            },
+        });
+
+        assert_eq!(state.selected_model_calls().count(), 1);
+        assert_eq!(
+            state
+                .selected_budget()
+                .and_then(|status| status.budget.max_total_tokens),
+            Some(100)
+        );
+        let unrelated_request = RequestId::from_stable_parts(&["unrelated-task"]);
+        state.turns.push(TurnView {
+            request_id: unrelated_request,
+            question: "unrelated".to_owned(),
+            profile: ExplanationProfile::default(),
+            answer_text: String::new(),
+            answer: None,
+            status: TurnStatus::Failed,
+        });
+        state.selected_task = Some(unrelated_request);
+        assert!(state.selected_budget().is_none());
+        state.selected_task = Some(RequestId::from_stable_parts(&["unknown-task"]));
+        assert!(state.selected_budget().is_none());
+    }
 
     fn repository_id(name: &str) -> RepositoryId {
         RepositoryId::from_stable_parts(&[name])
@@ -1204,8 +1516,257 @@ mod tests {
             diagram: DiagramDecision::NotNeeded {
                 reason: "A diagram would not add clarity.".to_owned(),
             },
+            suggested_actions: Vec::new(),
             usage: None,
         }
+    }
+
+    #[test]
+    fn explanation_profile_defaults_can_change_and_propagate_to_ask() {
+        let mut state = GuiState::new("profile-ask");
+        assert_eq!(
+            state.profile,
+            ExplanationProfile::new(
+                codeatlas_core::ExplanationAudience::Developer,
+                codeatlas_core::ExplanationDepth::Auto,
+            )
+        );
+        let repository_id = indexed(&mut state, "repo");
+        state.profile = ExplanationProfile::new(
+            codeatlas_core::ExplanationAudience::Expert,
+            codeatlas_core::ExplanationDepth::Code,
+        );
+        state.question_input = "How is this implemented?".to_owned();
+
+        let AppCommand::Ask {
+            repository_id: command_repository,
+            question,
+            profile,
+            ..
+        } = state.ask().expect("ask command")
+        else {
+            panic!("expected ask command");
+        };
+
+        assert_eq!(command_repository, repository_id);
+        assert_eq!(question, "How is this implemented?");
+        assert_eq!(profile, state.profile);
+        assert_eq!(state.turns[0].profile, profile);
+    }
+
+    #[test]
+    fn suggested_follow_up_uses_selected_answer_context_and_ignores_stale_answer() {
+        let mut state = GuiState::new("suggested-follow-up");
+        let repository_id = indexed(&mut state, "repo");
+        let original_profile = ExplanationProfile::new(
+            codeatlas_core::ExplanationAudience::Beginner,
+            codeatlas_core::ExplanationDepth::Overview,
+        );
+        state.profile = original_profile;
+        state.question_input = "Orient me".to_owned();
+        let AppCommand::Ask {
+            request_id: initial_request,
+            ..
+        } = state.ask().expect("ask command")
+        else {
+            panic!("expected ask command");
+        };
+        let action = SuggestedAction::ChangeDepth {
+            depth: codeatlas_core::ExplanationDepth::Architecture,
+        };
+        let mut completed = answer("Initial answer");
+        let answer_id = completed.id;
+        completed.suggested_actions.push(action);
+        state.reduce(AppEvent::AnswerCompleted {
+            request_id: initial_request,
+            answer: completed,
+        });
+
+        let AppCommand::RunSuggestedAction {
+            request_id,
+            session_id,
+            repository_id: command_repository,
+            answer_id: command_answer,
+            action: command_action,
+        } = state
+            .run_suggested_action(action)
+            .expect("suggested action command")
+        else {
+            panic!("expected suggested action command");
+        };
+
+        assert_eq!(session_id, state.session_id);
+        assert_eq!(command_repository, repository_id);
+        assert_eq!(command_answer, answer_id);
+        assert_eq!(command_action, action);
+        assert_eq!(state.turns.len(), 2);
+        assert_eq!(state.turns[1].question, action.label());
+        assert_eq!(
+            state.turns[1].profile,
+            ExplanationProfile::new(
+                codeatlas_core::ExplanationAudience::Beginner,
+                codeatlas_core::ExplanationDepth::Architecture,
+            )
+        );
+        assert_eq!(state.profile, state.turns[1].profile);
+
+        state.reduce(AppEvent::AnswerCompleted {
+            request_id: RequestId::from_stable_parts(&["stale-suggested-answer"]),
+            answer: answer("Stale"),
+        });
+        assert!(state.turns[1].answer.is_none());
+        state.reduce(AppEvent::AnswerCompleted {
+            request_id,
+            answer: answer("Follow-up"),
+        });
+        assert_eq!(state.turns[1].answer_text, "Follow-up");
+    }
+
+    #[test]
+    fn show_source_action_uses_evidence_viewer_without_creating_a_turn() {
+        let mut state = GuiState::new("suggested-source");
+        let repository_id = indexed(&mut state, "repo");
+        state.question_input = "Show me the implementation".to_owned();
+        let AppCommand::Ask {
+            request_id: initial_request,
+            ..
+        } = state.ask().expect("ask command")
+        else {
+            panic!("expected ask command");
+        };
+        let evidence = Evidence {
+            id: EvidenceId::from_stable_parts(&["suggested-source"]),
+            file_id: FileId::from_stable_parts(&["suggested-source-file"]),
+            path: RepositoryPath::new("src/source.rs").expect("path"),
+            span: SourceSpan::new(4, 0, 7, 0).expect("span"),
+            symbol_id: None,
+            excerpt: Some("fn source() {}".to_owned()),
+        };
+        let action = SuggestedAction::ShowSource {
+            evidence_id: evidence.id,
+        };
+        let mut completed = answer("Supported answer");
+        let answer_id = completed.id;
+        completed.evidence.push(evidence.clone());
+        completed.suggested_actions.push(action);
+        state.reduce(AppEvent::AnswerCompleted {
+            request_id: initial_request,
+            answer: completed,
+        });
+
+        let AppCommand::RunSuggestedAction {
+            request_id,
+            session_id,
+            repository_id: command_repository,
+            answer_id: command_answer,
+            action: command_action,
+        } = state
+            .run_suggested_action(action)
+            .expect("show source command")
+        else {
+            panic!("expected suggested action command");
+        };
+
+        assert_eq!(session_id, state.session_id);
+        assert_eq!(command_repository, repository_id);
+        assert_eq!(command_answer, answer_id);
+        assert_eq!(command_action, action);
+        assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.panel, WorkspacePanel::Evidence);
+        assert_eq!(state.selected_evidence, Some(evidence.id));
+        assert_eq!(
+            state.source.as_ref().expect("pending source").status,
+            SourceStatus::Loading
+        );
+        assert_eq!(state.source.as_ref().expect("pending source").end_line, 6);
+
+        state.reduce(AppEvent::SourceLoaded {
+            request_id: RequestId::from_stable_parts(&["stale-suggested-source"]),
+            repository_id,
+            path: evidence.path.clone(),
+            start_line: 4,
+            end_line: 7,
+            content: "stale".to_owned(),
+        });
+        assert_eq!(
+            state.source.as_ref().expect("pending source").content,
+            "fn source() {}"
+        );
+        state.reduce(AppEvent::SourceLoaded {
+            request_id,
+            repository_id,
+            path: evidence.path,
+            start_line: 4,
+            end_line: 6,
+            content: "loaded source".to_owned(),
+        });
+        assert_eq!(
+            state.source.as_ref().expect("loaded source").status,
+            SourceStatus::Loaded
+        );
+        assert_eq!(state.turns.len(), 1);
+    }
+
+    #[test]
+    fn loaded_session_restores_latest_and_selected_task_profiles() {
+        let mut state = GuiState::new("restored-profile");
+        let session_id = SessionId::from_stable_parts(&["restored-profile-session"]);
+        let AppCommand::LoadSession { request_id, .. } = state
+            .load_session(session_id)
+            .expect("load session command")
+        else {
+            panic!("expected load session");
+        };
+        let first_request = RequestId::from_stable_parts(&["restored-profile-first"]);
+        let latest_request = RequestId::from_stable_parts(&["restored-profile-latest"]);
+        let first_profile = ExplanationProfile::new(
+            codeatlas_core::ExplanationAudience::Beginner,
+            codeatlas_core::ExplanationDepth::Overview,
+        );
+        let latest_profile = ExplanationProfile::new(
+            codeatlas_core::ExplanationAudience::Expert,
+            codeatlas_core::ExplanationDepth::Detail,
+        );
+        let task =
+            |request_id, question: &str, profile, answer_text: &str| codeatlas_core::SessionTask {
+                request_id,
+                question: question.to_owned(),
+                profile,
+                status: SessionTaskStatus::Completed,
+                answer: Some(answer(answer_text)),
+                terminal_error: None,
+                budget_stop_reason: None,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                trajectory: Vec::new(),
+                model_calls: Vec::new(),
+                usage: None,
+                budget: None,
+            };
+        state.reduce(AppEvent::SessionLoaded {
+            request_id,
+            session: SessionContext {
+                schema_version: 4,
+                session_id,
+                repository_id: repository_id("restored-profile-repo"),
+                tasks: vec![
+                    task(first_request, "First", first_profile, "First answer"),
+                    task(latest_request, "Latest", latest_profile, "Latest answer"),
+                ],
+                usage: ModelUsage {
+                    tokens: TokenUsage::default(),
+                    cost: None,
+                },
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 2,
+                json_path: "session.json".to_owned(),
+            },
+        });
+
+        assert_eq!(state.selected_task, Some(latest_request));
+        assert_eq!(state.profile, latest_profile);
+        state.select_task(first_request);
+        assert_eq!(state.profile, first_profile);
     }
 
     #[test]
@@ -1419,8 +1980,17 @@ mod tests {
                 tasks: vec![codeatlas_core::SessionTask {
                     request_id: task_request_id,
                     question: "Restored question".to_owned(),
-                    answer: restored_answer,
-                    workflow: Vec::new(),
+                    profile: ExplanationProfile::default(),
+                    status: SessionTaskStatus::Completed,
+                    answer: Some(restored_answer),
+                    terminal_error: None,
+                    budget_stop_reason: None,
+                    started_at_unix_ms: 1,
+                    finished_at_unix_ms: 2,
+                    trajectory: Vec::new(),
+                    model_calls: Vec::new(),
+                    usage: Some(usage.clone()),
+                    budget: None,
                 }],
                 usage: usage.clone(),
                 created_at_unix_ms: 0,
@@ -1431,6 +2001,71 @@ mod tests {
 
         assert_eq!(state.selected_task, Some(task_request_id));
         assert_eq!(state.selected_usage(), Some(&usage));
+    }
+
+    #[test]
+    #[allow(
+        clippy::default_trait_access,
+        reason = "serde_json is intentionally not a GUI dependency"
+    )]
+    fn restored_budget_task_keeps_terminal_status_and_error() {
+        let mut state = GuiState::new("restored-budget");
+        let session_id = SessionId::from_stable_parts(&["restored-budget-session"]);
+        let AppCommand::LoadSession { request_id, .. } = state
+            .load_session(session_id)
+            .expect("load session command")
+        else {
+            panic!("expected load session");
+        };
+        let task_request = RequestId::from_stable_parts(&["restored-budget-task"]);
+        state.reduce(AppEvent::SessionLoaded {
+            request_id,
+            session: SessionContext {
+                schema_version: 3,
+                session_id,
+                repository_id: repository_id("restored-budget-repo"),
+                tasks: vec![codeatlas_core::SessionTask {
+                    request_id: task_request,
+                    question: "A broad question".to_owned(),
+                    profile: ExplanationProfile::default(),
+                    status: SessionTaskStatus::BudgetExceeded,
+                    answer: None,
+                    terminal_error: Some(AppError {
+                        code: "token_budget_exceeded".to_owned(),
+                        message: "token limit reached".to_owned(),
+                        retryable: false,
+                    }),
+                    budget_stop_reason: Some(
+                        codeatlas_core::BudgetStopReason::TotalTokensReached {
+                            used: 10,
+                            limit: 10,
+                        },
+                    ),
+                    started_at_unix_ms: 1,
+                    finished_at_unix_ms: 2,
+                    trajectory: vec![WorkflowEvent::ToolCallStarted(codeatlas_core::ToolCall {
+                        id: ToolCallId::from_stable_parts(&["restored-budget-tool"]),
+                        name: "read_file".to_owned(),
+                        arguments: Default::default(),
+                    })],
+                    model_calls: Vec::new(),
+                    usage: None,
+                    budget: None,
+                }],
+                usage: ModelUsage {
+                    tokens: TokenUsage::default(),
+                    cost: None,
+                },
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 2,
+                json_path: "session.json".to_owned(),
+            },
+        });
+
+        assert_eq!(state.turns[0].status, TurnStatus::BudgetExceeded);
+        assert_eq!(state.turns[0].answer_text, "token limit reached");
+        assert_eq!(state.status, WorkStatus::Error);
+        assert_eq!(state.activity[0].status, ActivityStatus::Failed);
     }
 
     #[test]

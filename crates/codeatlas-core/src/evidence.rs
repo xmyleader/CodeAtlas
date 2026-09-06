@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AnswerId, CallEdgeId, CallPathId, ClaimId, DiagramId, EvidenceId, FileId, ModelUsage,
-    RepositoryPath, SourceSpan, SymbolId, TargetResolution,
+    AnswerId, CallEdgeId, CallPathId, ClaimId, DiagramId, EvidenceId, ExplanationDepth, FileId,
+    ModelUsage, RepositoryPath, SourceSpan, SymbolId, TargetResolution,
 };
 
 const LEGACY_DIAGRAM_REASON: &str = "legacy session did not include a diagram decision";
@@ -138,6 +138,38 @@ pub struct CallPath {
     pub complete: bool,
 }
 
+/// A closed, non-executable follow-up capability offered by a grounded answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SuggestedAction {
+    DeepenClaim { claim_id: ClaimId },
+    ContinueCallPath { call_path_id: CallPathId },
+    ExplainEvidence { evidence_id: EvidenceId },
+    ShowSource { evidence_id: EvidenceId },
+    ChangeDepth { depth: ExplanationDepth },
+}
+
+impl SuggestedAction {
+    /// Returns a bounded runtime-owned label; models cannot supply action labels.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DeepenClaim { .. } => "Explain this claim in more depth",
+            Self::ContinueCallPath { .. } => "Continue this call path",
+            Self::ExplainEvidence { .. } => "Explain this evidence",
+            Self::ShowSource { .. } => "Show source",
+            Self::ChangeDepth { depth } => match depth {
+                ExplanationDepth::Auto => "Use automatic depth",
+                ExplanationDepth::Overview => "Switch to overview",
+                ExplanationDepth::Architecture => "Explore the architecture",
+                ExplanationDepth::Workflow => "Trace the workflow",
+                ExplanationDepth::Code => "Explain the code",
+                ExplanationDepth::Detail => "Go into full detail",
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentAnswer {
     pub id: AnswerId,
@@ -147,6 +179,8 @@ pub struct AgentAnswer {
     pub call_paths: Vec<CallPath>,
     #[serde(default)]
     pub diagram: DiagramDecision,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_actions: Vec<SuggestedAction>,
     pub usage: Option<ModelUsage>,
 }
 
@@ -155,7 +189,7 @@ impl AgentAnswer {
     ///
     /// # Errors
     ///
-    /// Returns [`EvidenceValidationError`] for duplicate evidence records,
+    /// Returns [`EvidenceValidationError`] for duplicate answer-local IDs,
     /// unsupported facts, or references to evidence not carried by the answer.
     pub fn validate_evidence(&self) -> Result<(), EvidenceValidationError> {
         let mut known = HashSet::with_capacity(self.evidence.len());
@@ -171,10 +205,18 @@ impl AgentAnswer {
         for claim in &self.claims {
             claim.validate_evidence()?;
             validate_references(claim.id, &claim.evidence_ids, &known)?;
-            known_claims.entry(claim.id).or_insert(claim);
+            if known_claims.insert(claim.id, claim).is_some() {
+                return Err(EvidenceValidationError::DuplicateClaim { claim_id: claim.id });
+            }
         }
 
+        let mut known_paths = HashSet::with_capacity(self.call_paths.len());
         for path in &self.call_paths {
+            if !known_paths.insert(path.id) {
+                return Err(EvidenceValidationError::DuplicateCallPath {
+                    call_path_id: path.id,
+                });
+            }
             for step in &path.steps {
                 for evidence_id in &step.evidence_ids {
                     if !known.contains(evidence_id) {
@@ -187,7 +229,57 @@ impl AgentAnswer {
             }
         }
 
-        validate_diagram_decision(&self.diagram, &known_claims, &known)
+        validate_diagram_decision(&self.diagram, &known_claims, &known)?;
+        self.validate_suggested_actions(&known_claims, &known_paths, &known)
+    }
+
+    fn validate_suggested_actions(
+        &self,
+        known_claims: &HashMap<ClaimId, &Claim>,
+        known_paths: &HashSet<CallPathId>,
+        known_evidence: &HashSet<EvidenceId>,
+    ) -> Result<(), EvidenceValidationError> {
+        if self.suggested_actions.len() > 4 {
+            return Err(EvidenceValidationError::TooManySuggestedActions {
+                actual: self.suggested_actions.len(),
+            });
+        }
+        let mut unique = HashSet::with_capacity(self.suggested_actions.len());
+        for action in &self.suggested_actions {
+            if !unique.insert(*action) {
+                return Err(EvidenceValidationError::DuplicateSuggestedAction);
+            }
+            match action {
+                SuggestedAction::DeepenClaim { claim_id }
+                    if !known_claims.contains_key(claim_id) =>
+                {
+                    return Err(EvidenceValidationError::UnknownSuggestedClaim {
+                        claim_id: *claim_id,
+                    });
+                }
+                SuggestedAction::ContinueCallPath { call_path_id }
+                    if !known_paths.contains(call_path_id) =>
+                {
+                    return Err(EvidenceValidationError::UnknownSuggestedCallPath {
+                        call_path_id: *call_path_id,
+                    });
+                }
+                SuggestedAction::ExplainEvidence { evidence_id }
+                | SuggestedAction::ShowSource { evidence_id }
+                    if !known_evidence.contains(evidence_id) =>
+                {
+                    return Err(EvidenceValidationError::UnknownSuggestedEvidence {
+                        evidence_id: *evidence_id,
+                    });
+                }
+                SuggestedAction::DeepenClaim { .. }
+                | SuggestedAction::ContinueCallPath { .. }
+                | SuggestedAction::ExplainEvidence { .. }
+                | SuggestedAction::ShowSource { .. }
+                | SuggestedAction::ChangeDepth { .. } => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -513,6 +605,10 @@ pub enum EvidenceValidationError {
     FactWithoutEvidence { claim_id: ClaimId },
     #[error("evidence {evidence_id} occurs more than once")]
     DuplicateEvidence { evidence_id: EvidenceId },
+    #[error("claim {claim_id} occurs more than once")]
+    DuplicateClaim { claim_id: ClaimId },
+    #[error("call path {call_path_id} occurs more than once")]
+    DuplicateCallPath { call_path_id: CallPathId },
     #[error("claim {claim_id} refers to unknown evidence {evidence_id}")]
     UnknownClaimEvidence {
         claim_id: ClaimId,
@@ -523,6 +619,16 @@ pub enum EvidenceValidationError {
         call_path_id: CallPathId,
         evidence_id: EvidenceId,
     },
+    #[error("answer offers {actual} suggested actions; at most 4 are allowed")]
+    TooManySuggestedActions { actual: usize },
+    #[error("answer offers the same suggested action more than once")]
+    DuplicateSuggestedAction,
+    #[error("suggested action refers to unknown claim {claim_id}")]
+    UnknownSuggestedClaim { claim_id: ClaimId },
+    #[error("suggested action refers to unknown call path {call_path_id}")]
+    UnknownSuggestedCallPath { call_path_id: CallPathId },
+    #[error("suggested action refers to unknown evidence {evidence_id}")]
+    UnknownSuggestedEvidence { evidence_id: EvidenceId },
     #[error("diagram decision reason must not be empty")]
     EmptyDiagramDecisionReason,
     #[error("diagram title must not be empty")]
@@ -658,8 +764,15 @@ impl EvidenceValidationError {
             self,
             Self::FactWithoutEvidence { .. }
                 | Self::DuplicateEvidence { .. }
+                | Self::DuplicateClaim { .. }
+                | Self::DuplicateCallPath { .. }
                 | Self::UnknownClaimEvidence { .. }
                 | Self::UnknownCallPathEvidence { .. }
+                | Self::TooManySuggestedActions { .. }
+                | Self::DuplicateSuggestedAction
+                | Self::UnknownSuggestedClaim { .. }
+                | Self::UnknownSuggestedCallPath { .. }
+                | Self::UnknownSuggestedEvidence { .. }
         )
     }
 }

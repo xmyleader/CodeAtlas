@@ -15,13 +15,13 @@ use std::{
 };
 
 use clap::Parser;
-use codeatlas_agent::{OpenAiChatClient, RuntimeSecretHeaders};
+use codeatlas_agent::{ModelPricing, OpenAiChatClient, RuntimeSecretHeaders};
 use codeatlas_app::{
     ApplicationConfig,
     credentials::{CredentialsStore, resolve_api_key},
     default_data_directory, spawn_application,
 };
-use codeatlas_core::ModelConfig;
+use codeatlas_core::{ModelBudget, ModelConfig, MonetaryBudget};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,13 +45,21 @@ struct Cli {
     #[arg(long, env = "CODEATLAS_MODEL", default_value = "gpt-4.1-mini")]
     model: String,
 
+    /// Optional provider reasoning mode (for example, enabled or disabled).
+    #[arg(long, env = "CODEATLAS_REASONING_MODE")]
+    reasoning_mode: Option<String>,
+
+    /// Optional provider reasoning effort (for example, low, medium, or high).
+    #[arg(long, env = "CODEATLAS_REASONING_EFFORT")]
+    reasoning_effort: Option<String>,
+
     /// Sampling temperature sent to the model.
     #[arg(long, env = "CODEATLAS_TEMPERATURE")]
     temperature: Option<f32>,
 
     /// Maximum output tokens requested from the model.
     #[arg(long, env = "CODEATLAS_MAX_OUTPUT_TOKENS")]
-    max_output_tokens: Option<u32>,
+    max_output_tokens: Option<NonZeroU32>,
 
     /// Model context window used to keep requests within provider limits.
     #[arg(long, env = "CODEATLAS_CONTEXT_WINDOW_TOKENS")]
@@ -72,6 +80,30 @@ struct Cli {
     /// Retries for immediately rejected HTTP 502, 503, and 504 responses.
     #[arg(long, env = "CODEATLAS_GATEWAY_MAX_RETRIES", default_value_t = 5)]
     gateway_max_retries: u8,
+
+    /// Currency label used by explicit model pricing and monetary budgets.
+    #[arg(long, env = "CODEATLAS_PRICING_CURRENCY", default_value = "USD")]
+    pricing_currency: String,
+
+    /// Uncached input price per million tokens.
+    #[arg(long, env = "CODEATLAS_INPUT_PRICE_PER_MILLION", value_parser = parse_non_negative_f64, requires = "output_price_per_million")]
+    input_price_per_million: Option<f64>,
+
+    /// Cached input price per million tokens; regular input pricing is the fallback.
+    #[arg(long, env = "CODEATLAS_CACHED_INPUT_PRICE_PER_MILLION", value_parser = parse_non_negative_f64, requires = "input_price_per_million")]
+    cached_input_price_per_million: Option<f64>,
+
+    /// Output price per million tokens.
+    #[arg(long, env = "CODEATLAS_OUTPUT_PRICE_PER_MILLION", value_parser = parse_non_negative_f64, requires = "input_price_per_million")]
+    output_price_per_million: Option<f64>,
+
+    /// Hard total-token limit for each agent task.
+    #[arg(long, env = "CODEATLAS_AGENT_MAX_TOTAL_TOKENS")]
+    agent_max_total_tokens: Option<NonZeroU64>,
+
+    /// Hard estimated-cost limit for each agent task.
+    #[arg(long, env = "CODEATLAS_AGENT_MAX_COST", value_parser = parse_positive_f64, requires_all = ["input_price_per_million", "output_price_per_million"])]
+    agent_max_cost: Option<f64>,
 
     /// External cache and session directory.
     #[arg(long, env = "CODEATLAS_DATA_DIR")]
@@ -116,8 +148,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let model_config = ModelConfig {
         endpoint: cli.endpoint,
         model: cli.model,
+        reasoning_mode: cli.reasoning_mode,
+        reasoning_effort: cli.reasoning_effort,
         temperature: cli.temperature,
-        max_output_tokens: cli.max_output_tokens,
+        max_output_tokens: cli.max_output_tokens.map(NonZeroU32::get),
         context_window_tokens: cli.context_window_tokens.map(NonZeroU32::get),
     };
     let secrets = resolve_api_key()?.map_or_else(
@@ -134,6 +168,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     config.agent.timeout = Duration::from_secs(cli.agent_timeout_seconds.get());
     config.agent.max_model_retries = cli.model_max_retries;
     config.agent.max_gateway_retries = cli.gateway_max_retries;
+    config.agent.pricing = cli
+        .input_price_per_million
+        .map(|input_per_million| ModelPricing {
+            currency: cli.pricing_currency.clone(),
+            input_per_million,
+            cached_input_per_million: cli.cached_input_price_per_million,
+            output_per_million: cli
+                .output_price_per_million
+                .expect("clap requires output pricing with input pricing"),
+        });
+    config.agent.budget = ModelBudget {
+        max_total_tokens: cli.agent_max_total_tokens.map(NonZeroU64::get),
+        max_cost: cli.agent_max_cost.map(|amount| MonetaryBudget {
+            currency: cli.pricing_currency,
+            amount,
+        }),
+    };
     let (channels, runner) = spawn_application(config, model)?;
     let initial_repository = cli
         .repository
@@ -144,6 +195,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     gui_result?;
     worker_result?;
     Ok(())
+}
+
+fn parse_non_negative_f64(value: &str) -> Result<f64, String> {
+    let parsed = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if parsed.is_finite() && parsed >= 0.0 {
+        Ok(parsed)
+    } else {
+        Err("value must be finite and non-negative".to_owned())
+    }
+}
+
+fn parse_positive_f64(value: &str) -> Result<f64, String> {
+    let parsed = parse_non_negative_f64(value)?;
+    if parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err("value must be greater than zero".to_owned())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -221,5 +290,38 @@ mod tests {
         assert_eq!(cli.model_max_retries, 2);
         assert_eq!(cli.gateway_max_retries, 5);
         assert_eq!(cli.repository, Some(PathBuf::from(".")));
+    }
+
+    #[test]
+    fn gui_parses_model_cost_controls() {
+        let cli = Cli::try_parse_from([
+            "codeatlas-gui",
+            "--reasoning-effort",
+            "medium",
+            "--input-price-per-million",
+            "1",
+            "--output-price-per-million",
+            "4",
+            "--agent-max-total-tokens",
+            "50000",
+            "--agent-max-cost",
+            "1.5",
+        ])
+        .expect("GUI cost controls should parse");
+
+        assert_eq!(cli.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            cli.agent_max_total_tokens.map(NonZeroU64::get),
+            Some(50_000)
+        );
+        assert_eq!(cli.agent_max_cost, Some(1.5));
+    }
+
+    #[test]
+    fn gui_rejects_zero_max_output_tokens() {
+        let cli = Cli::try_parse_from(["codeatlas-gui", "--max-output-tokens", "4096"])
+            .expect("positive output limit should parse");
+        assert_eq!(cli.max_output_tokens.map(NonZeroU32::get), Some(4_096));
+        assert!(Cli::try_parse_from(["codeatlas-gui", "--max-output-tokens", "0"]).is_err());
     }
 }

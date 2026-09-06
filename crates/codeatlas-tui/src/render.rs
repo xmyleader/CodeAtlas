@@ -2,7 +2,8 @@ use std::fmt::Display;
 
 use codeatlas_core::{
     ClaimKind, Diagram, DiagramDecision, DiagramKind, EntryPointKind, Evidence, EvidenceId,
-    Language, ProgressPhase, TargetResolution,
+    ExplanationAudience, ExplanationDepth, Language, ProgressPhase, SuggestedAction,
+    TargetResolution,
 };
 use ratatui::{
     Frame,
@@ -14,7 +15,8 @@ use ratatui::{
 
 use crate::app::{
     Activity, AnswerView, ClaimNumbers, ConversationEntry, EvidenceViewer, HistoryView, InputMode,
-    LayoutMode, Panel, ToolTraceStatus, TuiApp, evidence_line_range, evidence_number,
+    LayoutMode, Panel, ProfileField, SuggestedActionMenu, ToolTraceStatus, TuiApp,
+    evidence_line_range, evidence_number,
 };
 use crate::highlight::highlight_source_lines;
 
@@ -43,6 +45,14 @@ impl TuiApp {
             render_history(frame, self, area);
             return;
         }
+        if self.profile_settings().is_some() {
+            render_profile_settings(frame, self, area);
+            return;
+        }
+        if self.suggested_action_menu().is_some() {
+            render_suggested_actions(frame, self, area);
+            return;
+        }
         let mode = self.layout_mode(area.width, area.height);
         if mode == LayoutMode::Compact {
             render_compact(frame, self, area);
@@ -68,6 +78,126 @@ impl TuiApp {
         render_input(frame, self, input);
         render_status(frame, self, status);
     }
+}
+
+fn render_profile_settings(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let settings = app
+        .profile_settings()
+        .expect("profile settings render requires modal state");
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .title(Line::styled(
+            " Explanation Profile ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::new().fg(ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let draft = settings.draft();
+    let mut lines = vec![profile_field_line(
+        "Audience",
+        audience_label(draft.audience),
+        settings.field() == ProfileField::Audience,
+    )];
+    if inner.height > 1 {
+        lines.push(profile_field_line(
+            "Depth",
+            depth_label(draft.depth),
+            settings.field() == ProfileField::Depth,
+        ));
+    }
+    if inner.height > 2 && inner.width >= 40 {
+        lines.push(Line::styled(
+            "Presentation changes; evidence rules do not.",
+            Style::new().fg(MUTED),
+        ));
+    }
+    if inner.height > 3 {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "j/k, Up/Down, or Tab: field | Left/Right: value",
+            Style::new().fg(MUTED),
+        ));
+        lines.push(Line::styled(
+            "Enter apply | Esc cancel",
+            Style::new().fg(MUTED),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn profile_field_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(if selected { "> " } else { "  " }, Style::new().fg(ACCENT)),
+        Span::styled(format!("{label:<10}"), Style::new().fg(MUTED)),
+        Span::styled(
+            format!("< {value} >"),
+            if selected {
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::White)
+            },
+        ),
+    ])
+}
+
+fn render_suggested_actions(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let menu = app
+        .suggested_action_menu()
+        .expect("suggested action render requires modal state");
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .title(Line::styled(
+            " Suggested Actions ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::new().fg(ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let mut lines = suggested_action_lines(menu);
+    if usize::from(inner.height) > menu.actions().len() {
+        lines.push(Line::styled(
+            "j/k, arrows, or Tab: select | Enter run | Esc/A cancel",
+            Style::new().fg(MUTED),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn suggested_action_lines(menu: &SuggestedActionMenu) -> Vec<Line<'static>> {
+    menu.actions()
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let selected = index == menu.selected();
+            Line::from(vec![
+                Span::styled(if selected { "> " } else { "  " }, Style::new().fg(ACCENT)),
+                Span::styled(format!("{}. ", index + 1), Style::new().fg(MUTED)),
+                Span::styled(
+                    action.label(),
+                    if selected {
+                        Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new().fg(Color::White)
+                    },
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn render_history(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect) {
@@ -208,9 +338,18 @@ fn history_items(
                 ),
                 Span::styled(
                     format!(
-                        "{} task{} ",
+                        "{} task{} [{}] ",
                         session.tasks.len(),
-                        if session.tasks.len() == 1 { "" } else { "s" }
+                        if session.tasks.len() == 1 { "" } else { "s" },
+                        session
+                            .tasks
+                            .last()
+                            .map_or("empty", |task| match task.status {
+                                codeatlas_core::SessionTaskStatus::Completed => "completed",
+                                codeatlas_core::SessionTaskStatus::Failed => "failed",
+                                codeatlas_core::SessionTaskStatus::Cancelled => "cancelled",
+                                codeatlas_core::SessionTaskStatus::BudgetExceeded => "budget",
+                            })
                     ),
                     Style::new().fg(ACCENT),
                 ),
@@ -545,7 +684,12 @@ fn render_compact(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         return;
     }
     let mut lines = vec![Line::styled(
-        format!("CodeAtlas [{}]", activity_label(app.activity())),
+        format!(
+            "CodeAtlas [{}] {}/{}",
+            activity_label(app.activity()),
+            audience_label(app.profile().audience),
+            depth_label(app.profile().depth)
+        ),
         Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
     )];
     if area.height > 1 {
@@ -596,7 +740,7 @@ fn render_header(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMo
             Span::styled(repository.to_owned(), Style::new().fg(Color::White)),
             Span::styled(
                 format!(
-                    "  focus: {:?}  [Tab] panel  [i] index  [a] ask  [N] new  [h] history",
+                    "  focus: {:?}  [Tab] panel  [i] index  [a] ask  [g] profile  [A] actions",
                     app.focused_panel()
                 ),
                 Style::new().fg(MUTED),
@@ -726,11 +870,13 @@ fn repository_lines(app: &TuiApp) -> Vec<Line<'static>> {
         let marker = match tool.status {
             ToolTraceStatus::Running => ">",
             ToolTraceStatus::Completed => "+",
+            ToolTraceStatus::Cancelled => "x",
             ToolTraceStatus::Failed => "!",
         };
         let style = match tool.status {
             ToolTraceStatus::Running => Style::new().fg(ACCENT),
             ToolTraceStatus::Completed => Style::new().fg(FACT),
+            ToolTraceStatus::Cancelled => Style::new().fg(MUTED),
             ToolTraceStatus::Failed => Style::new().fg(ERROR),
         };
         lines.push(Line::from(vec![
@@ -767,8 +913,66 @@ fn repository_lines(app: &TuiApp) -> Vec<Line<'static>> {
         }
     }
 
+    append_model_calls(&mut lines, app);
+
     append_call_paths(&mut lines, app);
     lines
+}
+
+fn append_model_calls(lines: &mut Vec<Line<'static>>, app: &TuiApp) {
+    lines.push(section_line("MODEL CALLS"));
+    let model_calls = app.selected_model_calls().collect::<Vec<_>>();
+    if model_calls.is_empty() {
+        lines.push(Line::styled("  No model calls", Style::new().fg(MUTED)));
+    }
+    for call in model_calls {
+        let (marker, style) = match call.outcome {
+            codeatlas_core::ModelCallOutcome::Succeeded => ("+", Style::new().fg(FACT)),
+            codeatlas_core::ModelCallOutcome::Failed { .. }
+            | codeatlas_core::ModelCallOutcome::TimedOut => ("!", Style::new().fg(ERROR)),
+            codeatlas_core::ModelCallOutcome::Cancelled => ("x", Style::new().fg(MUTED)),
+        };
+        let usage = call.usage.map_or_else(
+            || "usage unavailable".to_owned(),
+            |usage| {
+                format!(
+                    "{} tokens (in {} / out {} / cached {})",
+                    usage.total_tokens,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cached_input_tokens
+                )
+            },
+        );
+        let cost = call.cost.as_ref().map_or_else(String::new, |cost| {
+            format!(" | ~{:.4} {}", cost.amount, cost.currency)
+        });
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {marker} #{} ", call.sequence), style),
+            Span::raw(format!("{} | {usage}{cost}", call.model)),
+        ]));
+    }
+    if let Some(status) = app.selected_budget() {
+        let token_limit = status.budget.max_total_tokens.map_or_else(
+            || "tokens unlimited".to_owned(),
+            |limit| format!("tokens {}/{}", status.usage.tokens.total_tokens, limit),
+        );
+        let cost_limit = status.budget.max_cost.as_ref().map_or_else(
+            || "cost unlimited".to_owned(),
+            |limit| {
+                format!(
+                    "cost {:.4}/{:.4} {}",
+                    status.usage.cost.as_ref().map_or(0.0, |cost| cost.amount),
+                    limit.amount,
+                    limit.currency
+                )
+            },
+        );
+        lines.push(Line::styled(
+            format!("  Budget: {token_limit} | {cost_limit}"),
+            Style::new().fg(MUTED),
+        ));
+    }
 }
 
 fn append_repository_map(lines: &mut Vec<Line<'static>>, app: &TuiApp) {
@@ -1033,6 +1237,25 @@ fn append_answer(
             ),
             Style::new().fg(INFERENCE),
         ));
+    }
+    if answer.complete && app.selected_task() == Some(answer.request_id) {
+        append_suggested_actions(lines, &answer.suggested_actions);
+    }
+}
+
+fn append_suggested_actions(lines: &mut Vec<Line<'static>>, actions: &[SuggestedAction]) {
+    if actions.is_empty() {
+        return;
+    }
+    lines.push(Line::styled(
+        "[A] SUGGESTED ACTIONS",
+        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ));
+    for (index, action) in actions.iter().take(4).enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {}. ", index + 1), Style::new().fg(MUTED)),
+            Span::styled(action.label(), Style::new().fg(Color::White)),
+        ]));
     }
 }
 
@@ -1308,16 +1531,20 @@ fn render_input(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     }
     let (title, content, active) = match app.input_mode() {
         InputMode::RepositoryPath => (
-            "Repository path - Enter: Index / Esc: close",
+            "Repository path - Enter: Index / Esc: close".to_owned(),
             app.repository_input(),
             true,
         ),
         InputMode::Question => (
-            "Question - Enter: Ask / Esc: close",
+            format!(
+                "Question ({}/{}) - Enter: Ask / Esc: close",
+                audience_label(app.profile().audience),
+                depth_label(app.profile().depth)
+            ),
             app.question_input(),
             true,
         ),
-        InputMode::Navigation => ("Keys", app.question_input(), false),
+        InputMode::Navigation => ("Keys".to_owned(), app.question_input(), false),
     };
 
     if area.height < 3 {
@@ -1450,7 +1677,7 @@ fn status_detail_line(app: &TuiApp, progress: Option<&codeatlas_core::Progress>)
         ])
     } else {
         Line::styled(
-            " Ready: [i] index, [a] ask, [N] new session, [h] history, [Tab] focus",
+            " Ready: [i] index, [a] ask, [g] profile, [A] actions, [h] history, [Tab] focus",
             Style::new().fg(MUTED),
         )
     }
@@ -1495,28 +1722,46 @@ fn navigation_help(app: &TuiApp, compact: bool) -> String {
     match app.focused_panel() {
         Panel::Repository => {
             if compact {
-                "i index | a/? ask | t details | [/] task | j/k scroll | n/p tool | q quit"
+                "i index | a/? ask | g profile | A actions | [/] task | j/k scroll | q quit"
                     .to_owned()
             } else {
-                "i index | a/? ask | N new | h history | t details | [/] task | Tab panels | j/k scroll | n/p tool | q quit".to_owned()
+                "i index | a/? ask | g profile | A actions | N new | h history | t details | [/] task | Tab panels | j/k scroll | n/p tool | q quit".to_owned()
             }
         }
         Panel::Conversation => {
             if compact {
-                "a/? ask | N new | h history | o diagram | [/] task | Tab panels | j/k scroll | q quit"
-                    .to_owned()
+                "a/? ask | g profile | A actions | [/] task | j/k scroll | q quit".to_owned()
             } else {
-                "a/? ask | N new | h history | o/y diagram | [/] task | c cancel | Tab panels | j/k scroll | q quit".to_owned()
+                "a/? ask | g profile | A actions | N new | h history | o/y diagram | [/] task | c cancel | Tab panels | j/k scroll | q quit".to_owned()
             }
         }
         Panel::Evidence => {
             if compact {
-                "Enter/v view | a/? ask | N new | h history | [/] task | j/k select | q quit"
+                "Enter/v view | g profile | A actions | a/? ask | [/] task | j/k select | q quit"
                     .to_owned()
             } else {
-                "Enter/v view | o/y diagram | a/? ask | N new | h history | [/] task | c cancel | Tab panels | j/k select | q quit".to_owned()
+                "Enter/v view | o/y diagram | a/? ask | g profile | A actions | N new | h history | [/] task | c cancel | Tab panels | j/k select | q quit".to_owned()
             }
         }
+    }
+}
+
+const fn audience_label(audience: ExplanationAudience) -> &'static str {
+    match audience {
+        ExplanationAudience::Beginner => "Beginner",
+        ExplanationAudience::Developer => "Developer",
+        ExplanationAudience::Expert => "Expert",
+    }
+}
+
+const fn depth_label(depth: ExplanationDepth) -> &'static str {
+    match depth {
+        ExplanationDepth::Auto => "Auto",
+        ExplanationDepth::Overview => "Overview",
+        ExplanationDepth::Architecture => "Architecture",
+        ExplanationDepth::Workflow => "Workflow",
+        ExplanationDepth::Code => "Code",
+        ExplanationDepth::Detail => "Detail",
     }
 }
 

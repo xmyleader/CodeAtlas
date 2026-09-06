@@ -6,6 +6,7 @@
 mod app;
 mod error;
 mod evidence;
+mod explanation;
 mod id;
 mod ir;
 mod model;
@@ -24,24 +25,32 @@ pub use error::CoreError;
 pub use evidence::{
     AgentAnswer, CallPath, CallPathStep, Claim, ClaimKind, Diagram, DiagramArtifact,
     DiagramDecision, DiagramEdge, DiagramKind, DiagramNode, Evidence, EvidenceValidationError,
+    SuggestedAction,
 };
+pub use explanation::{ExplanationAudience, ExplanationDepth, ExplanationProfile};
 pub use id::{
     AnswerId, CallEdgeId, CallPathId, ClaimId, DiagramId, EntryPointId, EvidenceId, FileId,
-    IdParseError, ImportEdgeId, ModuleId, ReferenceEdgeId, RepositoryId, RequestId, SessionId,
-    SymbolId, ToolCallId,
+    IdParseError, ImportEdgeId, ModelCallId, ModuleId, ReferenceEdgeId, RepositoryId, RequestId,
+    SessionId, SymbolId, ToolCallId,
 };
 pub use ir::{
     CallEdge, Confidence, ConfidenceError, EntryPoint, EntryPointKind, FileInfo, ImportEdge,
     ImportItem, Language, Module, ReferenceEdge, ReferenceKind, RepositoryModel, Symbol,
     SymbolKind, TargetResolution, UnresolvedTarget,
 };
-pub use model::{Cost, ModelConfig, ModelUsage, TokenUsage};
+pub use model::{
+    BudgetStopReason, Cost, ModelBudget, ModelBudgetStatus, ModelCallOutcome, ModelCallRecord,
+    ModelConfig, ModelUsage, MonetaryBudget, TokenUsage,
+};
 pub use parser::{
     ParseInput, ParsedCall, ParsedEntryPoint, ParsedFile, ParsedImport, ParsedModule,
     ParsedReference, ParsedSymbol, ParsedSymbolId, ParsedTarget, ParserAdapter, ParserError,
 };
 pub use path::{RepositoryPath, RepositoryPathError};
 pub use schema::{SCHEMA_VERSION, SchemaError, SchemaVersion};
-pub use session::{SessionContext, SessionSummary, SessionTask, SessionTaskSummary, WorkflowEvent};
+pub use session::{
+    SessionContext, SessionSummary, SessionTask, SessionTaskStatus, SessionTaskSummary,
+    WorkflowEvent,
+};
 pub use source::{SourcePosition, SourceSpan, SourceSpanError};
 pub use tool::{ToolCall, ToolDefinition, ToolError, ToolExecutor, ToolOutput};

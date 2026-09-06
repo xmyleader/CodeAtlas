@@ -15,15 +15,16 @@ use std::{
 
 use async_trait::async_trait;
 use codeatlas_agent::{
-    AssistantOutput, AssistantToolCall, ModelClient, ModelError, ModelRequest, ModelResponse,
-    ModelRole, SessionState, SessionStore, StructuredAnswer, StructuredClaim, StructuredDiagram,
-    StructuredDiagramDecision, StructuredDiagramEdge, StructuredDiagramNode,
+    AssistantOutput, AssistantToolCall, ModelClient, ModelError, ModelPricing, ModelRequest,
+    ModelResponse, ModelRole, SessionState, SessionStore, StructuredAnswer, StructuredClaim,
+    StructuredDiagram, StructuredDiagramDecision, StructuredDiagramEdge, StructuredDiagramNode,
 };
 use codeatlas_app::{ApplicationChannels, ApplicationConfig, ApplicationRunner, spawn_application};
 use codeatlas_core::{
     AgentAnswer, AppCommand, AppEvent, ClaimKind, DiagramDecision, DiagramId, DiagramKind,
-    EvidenceId, ProgressPhase, RepositoryId, RepositoryPath, RequestId, SessionId, TokenUsage,
-    WorkflowEvent,
+    EvidenceId, ExplanationAudience, ExplanationDepth, ExplanationProfile, ModelBudget,
+    ProgressPhase, RepositoryId, RepositoryPath, RequestId, SessionId, SessionTaskStatus,
+    SuggestedAction, TokenUsage, WorkflowEvent,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -265,6 +266,49 @@ impl ModelClient for GatedModel {
     }
 }
 
+struct LockDelayTimeoutModel {
+    lock_holder_started: Sender<()>,
+    timed_call_started: Sender<()>,
+    lock_hold: Duration,
+}
+
+#[async_trait]
+impl ModelClient for LockDelayTimeoutModel {
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let question = request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ModelRole::User)
+            .and_then(|message| message.content.as_deref());
+        if question == Some(FIRST_QUESTION) {
+            let _ = self.lock_holder_started.send(());
+            tokio::time::sleep(self.lock_hold).await;
+            return Ok(ModelResponse {
+                output: AssistantOutput::FinalAnswer {
+                    answer: StructuredAnswer {
+                        text: "The first request completed.".to_owned(),
+                        claims: vec![StructuredClaim {
+                            kind: ClaimKind::Inference,
+                            text: "The first request completed.".to_owned(),
+                            evidence_ids: Vec::new(),
+                        }],
+                        call_paths: Vec::new(),
+                        diagram: StructuredDiagramDecision::NotNeeded {
+                            reason: "No structural explanation is needed.".to_owned(),
+                        },
+                    },
+                },
+                usage: Some(token_usage(1, 1)),
+                finish_reason: Some("stop".to_owned()),
+            });
+        }
+
+        let _ = self.timed_call_started.send(());
+        std::future::pending::<Result<ModelResponse, ModelError>>().await
+    }
+}
+
 fn token_usage(input_tokens: u64, output_tokens: u64) -> TokenUsage {
     TokenUsage {
         input_tokens,
@@ -463,6 +507,7 @@ fn ask_until_terminal(
         session_id,
         repository_id,
         question: question.to_owned(),
+        profile: ExplanationProfile::default(),
     });
     application.receive_until("AnswerCompleted", |event| {
         matches!(
@@ -560,6 +605,36 @@ fn opening_an_unknown_diagram_id_is_rejected_without_launching_a_viewer() {
             && !error.retryable
     )));
     assert_eq!(model.calls.load(Ordering::Relaxed), 0);
+    application.shutdown();
+}
+
+#[test]
+fn corrupt_session_is_reported_without_preventing_startup() {
+    let temporary = TempDir::new().expect("temporary workspace should be created");
+    let data_directory = temporary.path().join("data");
+    let sessions = data_directory.join("sessions");
+    fs::create_dir_all(&sessions).expect("session directory should be created");
+    fs::write(sessions.join("corrupt.json"), b"{not json")
+        .expect("corrupt session fixture should be written");
+
+    let model: Arc<dyn ModelClient> = Arc::new(RejectingModel::default());
+    let application = RunningApplication::spawn(config(data_directory), model);
+    let events = application.receive_until("corrupt session diagnostic", |event| {
+        matches!(
+            event,
+            AppEvent::Error {
+                request_id: None,
+                error,
+            } if error.code == "corrupt_session_skipped"
+        )
+    });
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::Error { error, .. }
+            if error.code == "corrupt_session_skipped"
+                && error.message.contains("corrupt.json")
+    )));
     application.shutdown();
 }
 
@@ -860,19 +935,37 @@ fn mixed_repository_runs_offline_agent_and_restores_session_history() {
     assert_eq!(persisted.turns.len(), 1);
     assert_eq!(persisted.turns[0].request_id, first_request_id);
     assert_eq!(persisted.turns[0].question, FIRST_QUESTION);
-    assert_eq!(persisted.turns[0].answer, first_answer);
+    assert_eq!(persisted.turns[0].status, SessionTaskStatus::Completed);
+    assert_eq!(persisted.turns[0].answer.as_ref(), Some(&first_answer));
+    assert_eq!(persisted.turns[0].model_calls.len(), 2);
+    assert_eq!(
+        persisted.turns[0]
+            .trajectory
+            .iter()
+            .filter(|event| matches!(event, WorkflowEvent::ModelRequest { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        persisted.turns[0]
+            .trajectory
+            .iter()
+            .filter(|event| matches!(event, WorkflowEvent::ModelResponse { .. }))
+            .count(),
+        2
+    );
     assert!(
         persisted.turns[0]
-            .workflow
+            .trajectory
             .iter()
             .any(|event| matches!(event, WorkflowEvent::Progress(_)))
     );
-    assert!(persisted.turns[0].workflow.iter().any(|event| matches!(
+    assert!(persisted.turns[0].trajectory.iter().any(|event| matches!(
         event,
         WorkflowEvent::ToolCallStarted(call) if call.name == "find_symbol"
     )));
     let workflow_output = persisted.turns[0]
-        .workflow
+        .trajectory
         .iter()
         .find_map(|event| match event {
             WorkflowEvent::ToolCallCompleted {
@@ -880,13 +973,18 @@ fn mixed_repository_runs_offline_agent_and_restores_session_history() {
                 is_error: false,
                 ..
             } => Some(output),
-            WorkflowEvent::Progress(_)
-            | WorkflowEvent::ToolCallStarted(_)
-            | WorkflowEvent::ToolCallCompleted { .. } => None,
+            _ => None,
         })
         .expect("tool completion summary should be persisted");
-    assert!(workflow_output.contains("[source text omitted]"));
-    assert!(!workflow_output.contains("pub fn rust_entry"));
+    assert!(workflow_output.contains("pub fn rust_entry"));
+    assert!(!workflow_output.contains("[source text omitted]"));
+    let continued_tool_output = persisted.turns[0]
+        .continuation
+        .iter()
+        .find(|message| message.role == ModelRole::Tool)
+        .and_then(|message| message.content.as_deref())
+        .expect("full tool message should be retained for continuation");
+    assert!(continued_tool_output.contains("pub fn rust_entry"));
 
     let request_offset = model.requests().len();
     assert_eq!(request_offset, 2);
@@ -959,8 +1057,8 @@ fn mixed_repository_runs_offline_agent_and_restores_session_history() {
     assert_eq!(context.tasks.len(), 1);
     assert_eq!(context.created_at_unix_ms, persisted.created_at_unix_ms);
     assert_eq!(context.updated_at_unix_ms, persisted.updated_at_unix_ms);
-    assert_eq!(context.tasks[0].answer, first_answer);
-    assert!(!context.tasks[0].workflow.is_empty());
+    assert_eq!(context.tasks[0].answer.as_ref(), Some(&first_answer));
+    assert!(!context.tasks[0].trajectory.is_empty());
     assert_eq!(model.requests().len(), request_offset);
 
     let duplicate_events = ask_until_terminal(
@@ -992,19 +1090,32 @@ fn mixed_repository_runs_offline_agent_and_restores_session_history() {
         .expect("follow-up answer should be evidence-grounded");
 
     let requests = model.requests();
-    assert_eq!(requests.len(), request_offset + 2);
+    assert_eq!(requests.len(), request_offset + 1);
     let follow_up_initial_request = &requests[request_offset];
+    assert_eq!(
+        follow_up_initial_request
+            .messages
+            .iter()
+            .filter(|message| message.role == ModelRole::System)
+            .count(),
+        2
+    );
     let conversational_messages = follow_up_initial_request
         .messages
         .iter()
         .filter(|message| matches!(message.role, ModelRole::User | ModelRole::Assistant))
         .map(|message| (message.role, message.content.as_deref()))
         .collect::<Vec<_>>();
+    let tagged_first_answer = format!(
+        "[CodeAtlas persisted answer {}]\n{GROUNDED_TEXT}",
+        first_answer.id
+    );
     assert_eq!(
         conversational_messages,
         vec![
             (ModelRole::User, Some(FIRST_QUESTION)),
-            (ModelRole::Assistant, Some(GROUNDED_TEXT)),
+            (ModelRole::Assistant, None),
+            (ModelRole::Assistant, Some(tagged_first_answer.as_str())),
             (ModelRole::User, Some(FOLLOW_UP_QUESTION)),
         ]
     );
@@ -1012,7 +1123,7 @@ fn mixed_repository_runs_offline_agent_and_restores_session_history() {
         follow_up_initial_request
             .messages
             .iter()
-            .all(|message| message.role != ModelRole::Tool)
+            .any(|message| message.role == ModelRole::Tool)
     );
 
     restarted.shutdown();
@@ -1022,6 +1133,183 @@ fn mixed_repository_runs_offline_agent_and_restores_session_history() {
     assert_eq!(persisted.turns.len(), 2);
     assert_eq!(persisted.turns[1].request_id, follow_up_request_id);
     assert_eq!(persisted.turns[1].question, FOLLOW_UP_QUESTION);
+}
+
+#[test]
+fn suggested_actions_load_source_without_model_and_follow_up_in_the_same_profiled_session() {
+    let temporary = TempDir::new().expect("temporary workspace should be created");
+    let repository_root = temporary.path().join("repository");
+    let data_directory = temporary.path().join("data");
+    fs::create_dir(&repository_root).expect("fixture repository should be created");
+    fixture(&repository_root);
+
+    let model = Arc::new(AdaptiveModel::default());
+    let application_model: Arc<dyn ModelClient> = model.clone();
+    let application = RunningApplication::spawn(config(data_directory.clone()), application_model);
+    let (repository_id, _) = index_repository(&application, &repository_root, "actions");
+    let session_id = SessionId::from_stable_parts(&["actions", "session"]);
+    let initial_request_id = RequestId::from_stable_parts(&["actions", "initial"]);
+    let profile =
+        ExplanationProfile::new(ExplanationAudience::Beginner, ExplanationDepth::Overview);
+    application.send(AppCommand::Ask {
+        request_id: initial_request_id,
+        session_id,
+        repository_id,
+        question: FIRST_QUESTION.to_owned(),
+        profile,
+    });
+    let initial_events = application.receive_until("initial profiled answer", |event| {
+        matches!(
+            event,
+            AppEvent::AnswerCompleted { request_id, .. } if *request_id == initial_request_id
+        )
+    });
+    let answer = initial_events
+        .iter()
+        .find_map(|event| match event {
+            AppEvent::AnswerCompleted { answer, .. } => Some(answer.clone()),
+            _ => None,
+        })
+        .expect("initial answer should complete");
+    let show_source = answer
+        .suggested_actions
+        .iter()
+        .copied()
+        .find(|action| matches!(action, SuggestedAction::ShowSource { .. }))
+        .expect("grounded answer should offer source");
+    let model_calls_before_source = model.requests().len();
+    let source_request_id = RequestId::from_stable_parts(&["actions", "source"]);
+    application.send(AppCommand::RunSuggestedAction {
+        request_id: source_request_id,
+        session_id,
+        repository_id,
+        answer_id: answer.id,
+        action: show_source,
+    });
+    application.receive_until("suggested source", |event| {
+        matches!(
+            event,
+            AppEvent::SourceLoaded { request_id, .. } if *request_id == source_request_id
+        )
+    });
+    assert_eq!(model.requests().len(), model_calls_before_source);
+
+    let invalid_request_id = RequestId::from_stable_parts(&["actions", "invalid"]);
+    application.send(AppCommand::RunSuggestedAction {
+        request_id: invalid_request_id,
+        session_id,
+        repository_id,
+        answer_id: answer.id,
+        action: SuggestedAction::ShowSource {
+            evidence_id: EvidenceId::from_stable_parts(&["actions", "unknown-evidence"]),
+        },
+    });
+    application.receive_until("invalid suggested action", |event| {
+        matches!(
+            event,
+            AppEvent::Error {
+                request_id: Some(request_id),
+                error,
+            } if *request_id == invalid_request_id && error.code == "invalid_suggested_action"
+        )
+    });
+    assert_eq!(model.requests().len(), model_calls_before_source);
+
+    let intervening_request_id = RequestId::from_stable_parts(&["actions", "intervening"]);
+    let intervening_profile =
+        ExplanationProfile::new(ExplanationAudience::Expert, ExplanationDepth::Detail);
+    application.send(AppCommand::Ask {
+        request_id: intervening_request_id,
+        session_id,
+        repository_id,
+        question: "Explain the entry point one more time.".to_owned(),
+        profile: intervening_profile,
+    });
+    application.receive_until("intervening answer", |event| {
+        matches!(
+            event,
+            AppEvent::AnswerCompleted { request_id, .. } if *request_id == intervening_request_id
+        )
+    });
+
+    let change_depth = answer
+        .suggested_actions
+        .iter()
+        .copied()
+        .find(|action| {
+            matches!(
+                action,
+                SuggestedAction::ChangeDepth {
+                    depth: ExplanationDepth::Architecture
+                }
+            )
+        })
+        .expect("overview answer should offer architecture depth");
+    let follow_up_request_id = RequestId::from_stable_parts(&["actions", "follow-up"]);
+    application.send(AppCommand::RunSuggestedAction {
+        request_id: follow_up_request_id,
+        session_id,
+        repository_id,
+        answer_id: answer.id,
+        action: change_depth,
+    });
+    application.receive_until("suggested follow-up", |event| {
+        matches!(
+            event,
+            AppEvent::AnswerCompleted { request_id, .. } if *request_id == follow_up_request_id
+        )
+    });
+    let expected_follow_up_profile = ExplanationProfile::new(
+        ExplanationAudience::Beginner,
+        ExplanationDepth::Architecture,
+    );
+    let expected_control_message = expected_follow_up_profile.control_message();
+    assert_eq!(
+        model
+            .requests()
+            .last()
+            .expect("follow-up should call model")
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ModelRole::System)
+            .and_then(|message| message.content.as_deref()),
+        Some(expected_control_message.as_str())
+    );
+    let requests = model.requests();
+    let follow_up_user_message = requests
+        .last()
+        .expect("follow-up should call model")
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ModelRole::User)
+        .and_then(|message| message.content.as_deref())
+        .expect("follow-up should include a user message");
+    assert!(follow_up_user_message.contains(&answer.id.to_string()));
+    assert!(follow_up_user_message.contains(GROUNDED_TEXT));
+    let tagged_target = format!("[CodeAtlas persisted answer {}]", answer.id);
+    assert!(
+        requests
+            .last()
+            .expect("follow-up should call model")
+            .messages
+            .iter()
+            .any(|message| message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.starts_with(&tagged_target)))
+    );
+
+    application.shutdown();
+    let restored = SessionStore::new(data_directory.join("sessions"))
+        .load(session_id)
+        .expect("action session should persist");
+    assert_eq!(restored.turns.len(), 3);
+    assert_eq!(restored.turns[0].profile, profile);
+    assert_eq!(restored.turns[1].profile, intervening_profile);
+    assert_eq!(restored.turns[2].profile, expected_follow_up_profile);
+    assert_eq!(restored.turns[2].request_id, follow_up_request_id);
 }
 
 #[test]
@@ -1240,8 +1528,8 @@ fn rejected_ask_and_cancel_emit_stable_application_errors() {
     let temporary = TempDir::new().expect("temporary workspace should be created");
     let model = Arc::new(RejectingModel::default());
     let application_model: Arc<dyn ModelClient> = model.clone();
-    let application =
-        RunningApplication::spawn(config(temporary.path().join("data")), application_model);
+    let data_directory = temporary.path().join("data");
+    let application = RunningApplication::spawn(config(data_directory.clone()), application_model);
 
     let ask_request_id = RequestId::from_stable_parts(&["errors", "ask"]);
     application.send(AppCommand::Ask {
@@ -1249,6 +1537,7 @@ fn rejected_ask_and_cancel_emit_stable_application_errors() {
         session_id: SessionId::from_stable_parts(&["errors", "session"]),
         repository_id: RepositoryId::from_stable_parts(&["errors", "repository"]),
         question: "What is indexed?".to_owned(),
+        profile: ExplanationProfile::default(),
     });
     let ask_events = application.receive_until("repository_not_indexed", |event| {
         matches!(
@@ -1295,6 +1584,17 @@ fn rejected_ask_and_cancel_emit_stable_application_errors() {
 
     application.shutdown();
     assert_eq!(model.calls.load(Ordering::Relaxed), 0);
+    let failed = SessionStore::new(data_directory.join("sessions"))
+        .load(SessionId::from_stable_parts(&["errors", "session"]))
+        .expect("rejected ask should be persisted");
+    assert_eq!(failed.turns[0].status, SessionTaskStatus::Failed);
+    assert_eq!(
+        failed.turns[0]
+            .terminal_error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("repository_not_indexed")
+    );
 }
 
 #[test]
@@ -1307,8 +1607,8 @@ fn cancelling_an_ask_waiting_for_its_session_lock_is_prompt() {
     let (first_call_started, first_call_started_receiver) = std::sync::mpsc::channel();
     let model = Arc::new(GatedModel::new(first_call_started));
     let application_model: Arc<dyn ModelClient> = model.clone();
-    let application =
-        RunningApplication::spawn(config(temporary.path().join("data")), application_model);
+    let data_directory = temporary.path().join("data");
+    let application = RunningApplication::spawn(config(data_directory.clone()), application_model);
     let (repository_id, _) = index_repository(&application, &repository_root, "lock-cancel");
     let session_id = SessionId::from_stable_parts(&["lock-cancel", "session"]);
     let first_request_id = RequestId::from_stable_parts(&["lock-cancel", "first"]);
@@ -1319,6 +1619,7 @@ fn cancelling_an_ask_waiting_for_its_session_lock_is_prompt() {
         session_id,
         repository_id,
         question: FIRST_QUESTION.to_owned(),
+        profile: ExplanationProfile::default(),
     });
     first_call_started_receiver
         .recv_timeout(EVENT_TIMEOUT)
@@ -1328,6 +1629,7 @@ fn cancelling_an_ask_waiting_for_its_session_lock_is_prompt() {
         session_id,
         repository_id,
         question: FOLLOW_UP_QUESTION.to_owned(),
+        profile: ExplanationProfile::default(),
     });
     application.send(AppCommand::Cancel {
         request_id: RequestId::from_stable_parts(&["lock-cancel", "cancel"]),
@@ -1364,6 +1666,365 @@ fn cancelling_an_ask_waiting_for_its_session_lock_is_prompt() {
         1
     );
     application.shutdown();
+    let persisted = SessionStore::new(data_directory.join("sessions"))
+        .load(session_id)
+        .expect("completed and cancelled tasks should persist");
+    assert!(persisted.turns.iter().any(|turn| {
+        turn.request_id == waiting_request_id && turn.status == SessionTaskStatus::Cancelled
+    }));
+}
+
+#[test]
+fn cancelling_an_active_model_call_records_its_terminal_ledger_before_cancellation() {
+    let temporary = TempDir::new().expect("temporary workspace should be created");
+    let repository_root = temporary.path().join("repository");
+    let data_directory = temporary.path().join("data");
+    fs::create_dir(&repository_root).expect("fixture repository should be created");
+    fixture(&repository_root);
+    let (call_started, call_started_receiver) = std::sync::mpsc::channel();
+    let model = Arc::new(GatedModel::new(call_started));
+    let application = RunningApplication::spawn(config(data_directory.clone()), model);
+    let (repository_id, _) = index_repository(&application, &repository_root, "active-cancel");
+    let session_id = SessionId::from_stable_parts(&["active-cancel", "session"]);
+    let request_id = RequestId::from_stable_parts(&["active-cancel", "ask"]);
+    application.send(AppCommand::Ask {
+        request_id,
+        session_id,
+        repository_id,
+        question: FIRST_QUESTION.to_owned(),
+        profile: ExplanationProfile::default(),
+    });
+    call_started_receiver
+        .recv_timeout(EVENT_TIMEOUT)
+        .expect("ask should reach the model");
+    application.send(AppCommand::Cancel {
+        request_id: RequestId::from_stable_parts(&["active-cancel", "cancel"]),
+        target_request_id: request_id,
+    });
+    let events = application.receive_until("active ask cancellation", |event| {
+        matches!(event, AppEvent::Cancelled { request_id: event_request } if *event_request == request_id)
+    });
+    let ledger = event_position(&events, |event| {
+        matches!(
+            event,
+            AppEvent::ModelCallRecorded {
+                request_id: event_request,
+                record,
+            } if *event_request == request_id
+                && record.outcome == codeatlas_core::ModelCallOutcome::Cancelled
+        )
+    });
+    let cancelled = event_position(
+        &events,
+        |event| matches!(event, AppEvent::Cancelled { request_id: event_request } if *event_request == request_id),
+    );
+    assert!(ledger < cancelled);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AppEvent::Cancelled { request_id: event_request } if *event_request == request_id))
+            .count(),
+        1
+    );
+
+    application.shutdown();
+    let persisted = SessionStore::new(data_directory.join("sessions"))
+        .load(session_id)
+        .expect("cancelled task should be persisted");
+    assert_eq!(persisted.turns[0].status, SessionTaskStatus::Cancelled);
+    assert!(matches!(
+        persisted.turns[0].model_calls[0].outcome,
+        codeatlas_core::ModelCallOutcome::Cancelled
+    ));
+}
+
+#[test]
+fn session_lock_wait_reduces_runtime_timeout_and_persists_timed_out_ledger() {
+    let temporary = TempDir::new().expect("temporary workspace should be created");
+    let repository_root = temporary.path().join("repository");
+    let data_directory = temporary.path().join("data");
+    fs::create_dir(&repository_root).expect("fixture repository should be created");
+    fixture(&repository_root);
+    let (lock_holder_started, lock_holder_started_receiver) = std::sync::mpsc::channel();
+    let (timed_call_started, timed_call_started_receiver) = std::sync::mpsc::channel();
+    let model = Arc::new(LockDelayTimeoutModel {
+        lock_holder_started,
+        timed_call_started,
+        lock_hold: Duration::from_millis(500),
+    });
+    let mut application_config = config(data_directory.clone());
+    application_config.agent.timeout = Duration::from_millis(800);
+    let application = RunningApplication::spawn(application_config, model);
+    let (repository_id, _) = index_repository(&application, &repository_root, "active-timeout");
+    let session_id = SessionId::from_stable_parts(&["active-timeout", "session"]);
+    let lock_holder_request = RequestId::from_stable_parts(&["active-timeout", "lock-holder"]);
+    let request_id = RequestId::from_stable_parts(&["active-timeout", "ask"]);
+    application.send(AppCommand::Ask {
+        request_id: lock_holder_request,
+        session_id,
+        repository_id,
+        question: FIRST_QUESTION.to_owned(),
+        profile: ExplanationProfile::default(),
+    });
+    lock_holder_started_receiver
+        .recv_timeout(EVENT_TIMEOUT)
+        .expect("first ask should hold the session lock");
+    let ask_started = Instant::now();
+    application.send(AppCommand::Ask {
+        request_id,
+        session_id,
+        repository_id,
+        question: FOLLOW_UP_QUESTION.to_owned(),
+        profile: ExplanationProfile::default(),
+    });
+    timed_call_started_receiver
+        .recv_timeout(EVENT_TIMEOUT)
+        .expect("waiting ask should reach the model after the lock is released");
+    let model_started = Instant::now();
+    assert!(ask_started.elapsed() >= Duration::from_millis(400));
+    let events = application.receive_until("active model timeout", |event| {
+        matches!(
+            event,
+            AppEvent::Error {
+                request_id: Some(event_request),
+                error,
+            } if *event_request == request_id && error.code == "runtime_timeout"
+        )
+    });
+    let ledger = event_position(&events, |event| {
+        matches!(
+            event,
+            AppEvent::ModelCallRecorded {
+                request_id: event_request,
+                record,
+            } if *event_request == request_id
+                && record.outcome == codeatlas_core::ModelCallOutcome::TimedOut
+        )
+    });
+    let timeout = event_position(&events, |event| {
+        matches!(
+            event,
+            AppEvent::Error {
+                request_id: Some(event_request),
+                error,
+            } if *event_request == request_id && error.code == "runtime_timeout"
+        )
+    });
+    assert!(ledger < timeout);
+    assert!(model_started.elapsed() < Duration::from_millis(600));
+    assert!(ask_started.elapsed() < Duration::from_millis(1_100));
+
+    application.shutdown();
+    let persisted = SessionStore::new(data_directory.join("sessions"))
+        .load(session_id)
+        .expect("timed-out task should be persisted");
+    assert_eq!(persisted.turns.len(), 2);
+    assert_eq!(persisted.turns[0].request_id, lock_holder_request);
+    assert_eq!(persisted.turns[1].request_id, request_id);
+    assert_eq!(persisted.turns[1].status, SessionTaskStatus::Failed);
+    assert!(matches!(
+        persisted.turns[1].model_calls[0].outcome,
+        codeatlas_core::ModelCallOutcome::TimedOut
+    ));
+}
+
+#[test]
+fn token_budget_exceeded_task_persists_ledger_usage_and_reason() {
+    let temporary = TempDir::new().expect("temporary workspace should be created");
+    let repository_root = temporary.path().join("repository");
+    let data_directory = temporary.path().join("data");
+    fs::create_dir(&repository_root).expect("fixture repository should be created");
+    fixture(&repository_root);
+    let mut application_config = config(data_directory.clone());
+    application_config.agent.budget = ModelBudget {
+        max_total_tokens: Some(1),
+        max_cost: None,
+    };
+    let application =
+        RunningApplication::spawn(application_config, Arc::new(AdaptiveModel::default()));
+    let (repository_id, _) = index_repository(&application, &repository_root, "budget-history");
+    let session_id = SessionId::from_stable_parts(&["budget-history", "session"]);
+    let request_id = RequestId::from_stable_parts(&["budget-history", "ask"]);
+    let events = ask_until_terminal(
+        &application,
+        request_id,
+        session_id,
+        repository_id,
+        FIRST_QUESTION,
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::BudgetExceeded { request_id: event_request, .. }
+            if *event_request == request_id
+    )));
+    application.shutdown();
+
+    let persisted = SessionStore::new(data_directory.join("sessions"))
+        .load(session_id)
+        .expect("budget stop should persist");
+    let task = &persisted.turns[0];
+    assert_eq!(task.status, SessionTaskStatus::BudgetExceeded);
+    assert!(task.answer.is_none());
+    assert!(task.budget_stop_reason.is_some());
+    assert_eq!(task.model_calls.len(), 1);
+    assert_eq!(
+        task.usage.as_ref().map(|usage| usage.tokens.total_tokens),
+        Some(7)
+    );
+    assert_eq!(persisted.usage.tokens.total_tokens, 7);
+}
+
+#[test]
+fn model_failure_persists_request_error_and_failed_call_record() {
+    let temporary = TempDir::new().expect("temporary workspace should be created");
+    let repository_root = temporary.path().join("repository");
+    let data_directory = temporary.path().join("data");
+    fs::create_dir(&repository_root).expect("fixture repository should be created");
+    fixture(&repository_root);
+    let application = RunningApplication::spawn(
+        config(data_directory.clone()),
+        Arc::new(RejectingModel::default()),
+    );
+    let (repository_id, _) = index_repository(&application, &repository_root, "model-failure");
+    let session_id = SessionId::from_stable_parts(&["model-failure", "session"]);
+    let request_id = RequestId::from_stable_parts(&["model-failure", "ask"]);
+    let events = ask_until_terminal(
+        &application,
+        request_id,
+        session_id,
+        repository_id,
+        FIRST_QUESTION,
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::Error {
+            request_id: Some(event_request),
+            error,
+        } if *event_request == request_id && error.code == "model_error"
+    )));
+    application.shutdown();
+
+    let persisted = SessionStore::new(data_directory.join("sessions"))
+        .load(session_id)
+        .expect("failed model task should persist");
+    let task = &persisted.turns[0];
+    assert_eq!(task.status, SessionTaskStatus::Failed);
+    assert_eq!(task.model_calls.len(), 1);
+    assert!(matches!(
+        task.model_calls[0].outcome,
+        codeatlas_core::ModelCallOutcome::Failed {
+            retryable: false,
+            ..
+        }
+    ));
+    assert!(
+        task.trajectory
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::ModelRequest { .. }))
+    );
+    assert!(
+        task.trajectory
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::ModelError { .. }))
+    );
+    assert!(task.answer.is_none());
+    assert!(task.terminal_error.is_some());
+}
+
+#[test]
+fn mixed_currency_session_preserves_both_tasks_ledgers_and_transcripts() {
+    let temporary = TempDir::new().expect("temporary workspace should be created");
+    let repository_root = temporary.path().join("repository");
+    let data_directory = temporary.path().join("data");
+    fs::create_dir(&repository_root).expect("fixture repository should be created");
+    fixture(&repository_root);
+    let pricing = |currency: &str| ModelPricing {
+        currency: currency.to_owned(),
+        input_per_million: 1.0,
+        cached_input_per_million: None,
+        output_per_million: 1.0,
+    };
+    let session_id = SessionId::from_stable_parts(&["currency-mismatch", "session"]);
+
+    let mut first_config = config(data_directory.clone());
+    first_config.agent.pricing = Some(pricing("EUR"));
+    let first = RunningApplication::spawn(first_config, Arc::new(AdaptiveModel::default()));
+    let (repository_id, _) = index_repository(&first, &repository_root, "currency-mismatch-first");
+    let first_request_id = RequestId::from_stable_parts(&["currency-mismatch", "first"]);
+    ask(
+        &first,
+        first_request_id,
+        session_id,
+        repository_id,
+        FIRST_QUESTION,
+    );
+    first.shutdown();
+
+    let mut second_config = config(data_directory.clone());
+    second_config.agent.pricing = Some(pricing("USD"));
+    let second = RunningApplication::spawn(second_config, Arc::new(AdaptiveModel::default()));
+    let (reloaded_repository_id, _) =
+        index_repository(&second, &repository_root, "currency-mismatch-second");
+    assert_eq!(reloaded_repository_id, repository_id);
+    let request_id = RequestId::from_stable_parts(&["currency-mismatch", "second"]);
+    let (_, events) = ask(
+        &second,
+        request_id,
+        session_id,
+        repository_id,
+        FOLLOW_UP_QUESTION,
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AppEvent::AnswerCompleted {
+                    request_id: event_request,
+                    ..
+                } if *event_request == request_id
+            ))
+            .count(),
+        1
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        AppEvent::Error {
+            request_id: Some(event_request),
+            ..
+        } if *event_request == request_id
+    )));
+
+    second.shutdown();
+    let persisted = SessionStore::new(data_directory.join("sessions"))
+        .load(session_id)
+        .expect("both mixed-currency tasks should persist");
+    assert_eq!(persisted.turns.len(), 2);
+    assert_eq!(persisted.turns[0].request_id, first_request_id);
+    assert_eq!(persisted.turns[1].request_id, request_id);
+    assert_eq!(persisted.usage.tokens.total_tokens, 27);
+    assert!(persisted.usage.cost.is_none());
+    assert_eq!(
+        persisted.turns[0]
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cost.as_ref())
+            .map(|cost| cost.currency.as_str()),
+        Some("EUR")
+    );
+    assert_eq!(
+        persisted.turns[1]
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cost.as_ref())
+            .map(|cost| cost.currency.as_str()),
+        Some("USD")
+    );
+    assert_eq!(persisted.turns[0].model_calls.len(), 2);
+    assert_eq!(persisted.turns[1].model_calls.len(), 1);
+    assert!(persisted.turns.iter().all(|turn| {
+        !turn.continuation.is_empty() && turn.model_calls.iter().all(|record| record.cost.is_some())
+    }));
 }
 
 #[test]
@@ -1424,6 +2085,38 @@ fn session_save_failure_still_publishes_answer_and_keeps_in_memory_history() {
             && error.message.contains("was not persisted")
             && error.retryable
     )));
+
+    let answer = events
+        .iter()
+        .find_map(|event| match event {
+            AppEvent::AnswerCompleted { answer, .. } => Some(answer),
+            _ => None,
+        })
+        .expect("failed persistence should still publish the answer");
+    let action = answer
+        .suggested_actions
+        .first()
+        .copied()
+        .expect("grounded answer should offer an action");
+    let action_request_id = RequestId::from_stable_parts(&["save-failure", "action"]);
+    application.send(AppCommand::RunSuggestedAction {
+        request_id: action_request_id,
+        session_id,
+        repository_id,
+        answer_id: answer.id,
+        action,
+    });
+    application.receive_until("unpersisted action rejection", |event| {
+        matches!(
+            event,
+            AppEvent::Error {
+                request_id: Some(event_request_id),
+                error,
+            } if *event_request_id == action_request_id
+                && error.code == "invalid_suggested_action"
+                && error.message.contains("was not persisted")
+        )
+    });
 
     let load_request_id = RequestId::from_stable_parts(&["save-failure", "load"]);
     application.send(AppCommand::LoadSession {
@@ -1717,7 +2410,7 @@ fn needed_diagram_writes_canonical_svg_and_persists_artifact() {
         session_id,
     );
     assert_eq!(persisted.turns.len(), 1);
-    assert_eq!(persisted.turns[0].answer, answer);
+    assert_eq!(persisted.turns[0].answer.as_ref(), Some(&answer));
 
     #[cfg(unix)]
     {
@@ -1804,25 +2497,29 @@ fn malicious_diagram_title_is_escaped_in_stored_svg() {
 }
 
 #[test]
-fn data_directory_inside_repository_degrades_diagram_and_publishes_answer() {
+fn data_directory_inside_repository_rejects_index_before_writing() {
     let temporary = TempDir::new().expect("temporary workspace should be created");
     let repository_root = temporary.path().join("repository");
     let data_directory = repository_root.join(".codeatlas-data");
     fs::create_dir(&repository_root).expect("fixture repository should be created");
     fixture(&repository_root);
 
-    let model: Arc<dyn ModelClient> = Arc::new(DiagramModel::new("Rejected diagram"));
-    let application = RunningApplication::spawn(config(data_directory.clone()), model);
-    let (repository_id, _) = index_repository(&application, &repository_root, "diagram-in-repo");
-    let request_id = RequestId::from_stable_parts(&["diagram-in-repo", "request"]);
-    let session_id = SessionId::from_stable_parts(&["diagram-in-repo", "session"]);
-    let events = ask_until_terminal(
-        &application,
+    let model = Arc::new(RejectingModel::default());
+    let application = RunningApplication::spawn(config(data_directory.clone()), model.clone());
+    let request_id = RequestId::from_stable_parts(&["data-in-repo", "index"]);
+    application.send(AppCommand::Index {
         request_id,
-        session_id,
-        repository_id,
-        FIRST_QUESTION,
-    );
+        repository_root: repository_root.to_string_lossy().into_owned(),
+    });
+    let events = application.receive_until("unsafe data directory rejection", |event| {
+        matches!(
+            event,
+            AppEvent::Error {
+                request_id: Some(event_request_id),
+                error,
+            } if *event_request_id == request_id && error.code == "index_failed"
+        )
+    });
     let error = events
         .iter()
         .find_map(|event| match event {
@@ -1832,38 +2529,54 @@ fn data_directory_inside_repository_degrades_diagram_and_publishes_answer() {
             } if *event_request_id == request_id => Some(error),
             _ => None,
         })
-        .expect("diagram generation should emit an error");
+        .expect("index should emit an error");
 
-    assert_eq!(error.code, "diagram_generation_failed");
-    assert!(!error.retryable);
-    assert!(!error.message.contains("rust_helper();"));
-    let answer = events
-        .iter()
-        .find_map(|event| match event {
-            AppEvent::AnswerCompleted {
-                request_id: event_request_id,
-                answer,
-            } if *event_request_id == request_id => Some(answer),
-            _ => None,
-        })
-        .expect("valid answer should still be published");
-    let DiagramDecision::Needed { diagram, .. } = &answer.diagram else {
-        panic!("degraded answer should preserve the diagram decision");
-    };
-    assert!(diagram.artifact.is_none());
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, AppEvent::AnswerCompleted { .. }))
-            .count(),
-        1
+    assert_eq!(error.code, "index_failed");
+    assert!(
+        error
+            .message
+            .contains("must be outside analyzed repository")
     );
-    assert!(!data_directory.join("diagrams").exists());
-    let persisted = load_session_eventually(
-        &SessionStore::new(data_directory.join("sessions")),
-        session_id,
-    );
-    assert_eq!(persisted.turns[0].answer, *answer);
+    assert!(!data_directory.exists());
+    assert_eq!(model.calls.load(Ordering::Relaxed), 0);
+    application.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn data_directory_symlink_into_repository_rejects_index() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TempDir::new().expect("temporary workspace should be created");
+    let repository_root = temporary.path().join("repository");
+    let linked_data = temporary.path().join("linked-data");
+    fs::create_dir(&repository_root).expect("fixture repository should be created");
+    fixture(&repository_root);
+    symlink(&repository_root, &linked_data).expect("data directory symlink");
+
+    let model = Arc::new(RejectingModel::default());
+    let application = RunningApplication::spawn(config(linked_data), model);
+    let request_id = RequestId::from_stable_parts(&["linked-data-in-repo", "index"]);
+    application.send(AppCommand::Index {
+        request_id,
+        repository_root: repository_root.to_string_lossy().into_owned(),
+    });
+    let events = application.receive_until("symlinked data directory rejection", |event| {
+        matches!(
+            event,
+            AppEvent::Error {
+                request_id: Some(event_request_id),
+                error,
+            } if *event_request_id == request_id && error.code == "index_failed"
+        )
+    });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::Error { error, .. } if error.message.contains("must be outside analyzed repository")
+    )));
+    assert!(!repository_root.join("indexes").exists());
+    assert!(!repository_root.join("sessions").exists());
+    assert!(!repository_root.join("diagrams").exists());
     application.shutdown();
 }
 
@@ -1928,7 +2641,7 @@ fn diagram_storage_rejects_symlink_escape() {
         &SessionStore::new(data_directory.join("sessions")),
         SessionId::from_stable_parts(&["diagram-symlink", "session"]),
     );
-    assert_eq!(persisted.turns[0].answer, *answer);
+    assert_eq!(persisted.turns[0].answer.as_ref(), Some(answer));
     application.shutdown();
 }
 
@@ -2116,6 +2829,6 @@ fn conflicting_existing_artifact_degrades_without_overwrite() {
         b"conflicting artifact bytes"
     );
     let persisted = load_session_eventually(&session_store, session_id);
-    assert_eq!(persisted.turns[0].answer, *answer);
+    assert_eq!(persisted.turns[0].answer.as_ref(), Some(answer));
     second_application.shutdown();
 }

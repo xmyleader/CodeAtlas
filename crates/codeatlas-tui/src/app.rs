@@ -6,10 +6,12 @@ use std::{
 };
 
 use codeatlas_core::{
-    AgentAnswer, AppCommand, AppError, AppEvent, CallPath, Claim, ClaimKind, Cost, DiagramArtifact,
-    DiagramDecision, DiagramId, Evidence, EvidenceId, ModelUsage, Progress, ProgressPhase,
-    RepositoryId, RepositoryMap, RepositoryPath, RequestId, SessionContext, SessionId,
-    SessionSummary, SymbolId, TokenUsage, ToolCallId, WorkflowEvent,
+    AgentAnswer, AnswerId, AppCommand, AppError, AppEvent, CallPath, Claim, ClaimKind, Cost,
+    DiagramArtifact, DiagramDecision, DiagramId, Evidence, EvidenceId, ExplanationAudience,
+    ExplanationDepth, ExplanationProfile, ModelBudgetStatus, ModelCallRecord, ModelUsage, Progress,
+    ProgressPhase, RepositoryId, RepositoryMap, RepositoryPath, RequestId, SessionContext,
+    SessionId, SessionSummary, SessionTask, SessionTaskStatus, SuggestedAction, SymbolId,
+    TokenUsage, ToolCallId, WorkflowEvent,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde::{Deserialize, Serialize};
@@ -133,11 +135,57 @@ pub enum ConversationEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnswerView {
     pub request_id: RequestId,
+    pub answer_id: Option<AnswerId>,
     pub text: String,
     pub claims: Vec<Claim>,
     pub call_paths: Vec<CallPath>,
     pub diagram: Option<DiagramDecision>,
+    pub suggested_actions: Vec<SuggestedAction>,
     pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileField {
+    Audience,
+    Depth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileSettings {
+    draft: ExplanationProfile,
+    field: ProfileField,
+}
+
+impl ProfileSettings {
+    #[must_use]
+    pub const fn draft(&self) -> ExplanationProfile {
+        self.draft
+    }
+
+    #[must_use]
+    pub const fn field(&self) -> ProfileField {
+        self.field
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestedActionMenu {
+    answer_request_id: RequestId,
+    answer_id: AnswerId,
+    actions: Vec<SuggestedAction>,
+    selected: usize,
+}
+
+impl SuggestedActionMenu {
+    #[must_use]
+    pub fn actions(&self) -> &[SuggestedAction] {
+        &self.actions
+    }
+
+    #[must_use]
+    pub const fn selected(&self) -> usize {
+        self.selected
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +218,7 @@ impl ClaimNumbers {
 pub enum ToolTraceStatus {
     Running,
     Completed,
+    Cancelled,
     Failed,
 }
 
@@ -226,6 +275,7 @@ struct PendingSourceLoad {
     repository_id: RepositoryId,
     path: RepositoryPath,
     start_line: u32,
+    end_line: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +427,15 @@ enum RequestOutcome {
     Failed,
 }
 
+const fn task_status_label(status: SessionTaskStatus) -> &'static str {
+    match status {
+        SessionTaskStatus::Completed => "Completed",
+        SessionTaskStatus::Failed => "Failed",
+        SessionTaskStatus::Cancelled => "Cancelled",
+        SessionTaskStatus::BudgetExceeded => "Budget exceeded",
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InputBuffer {
     value: String,
@@ -474,6 +533,10 @@ pub struct TuiApp {
     next_request_sequence: u64,
     next_session_sequence: u64,
     preferences: UiPreferences,
+    profile: ExplanationProfile,
+    profiles_by_request: BTreeMap<RequestId, ExplanationProfile>,
+    profile_settings: Option<ProfileSettings>,
+    suggested_action_menu: Option<SuggestedActionMenu>,
     focused_panel: Panel,
     input_mode: InputMode,
     repository_input: InputBuffer,
@@ -501,6 +564,8 @@ pub struct TuiApp {
     pending_diagram_opens: BTreeMap<RequestId, (RequestId, DiagramId)>,
     diagram_open_status: BTreeMap<RequestId, String>,
     usage_by_request: BTreeMap<RequestId, ModelUsage>,
+    model_calls: Vec<(RequestId, ModelCallRecord)>,
+    budgets: BTreeMap<RequestId, ModelBudgetStatus>,
     repository_scroll: u16,
     conversation_scroll: u16,
     conversation_follow_tail: bool,
@@ -567,6 +632,10 @@ impl TuiApp {
             next_request_sequence: 0,
             next_session_sequence: 0,
             preferences,
+            profile: ExplanationProfile::default(),
+            profiles_by_request: BTreeMap::new(),
+            profile_settings: None,
+            suggested_action_menu: None,
             focused_panel: Panel::Repository,
             input_mode: InputMode::RepositoryPath,
             repository_input: InputBuffer::default(),
@@ -594,6 +663,8 @@ impl TuiApp {
             pending_diagram_opens: BTreeMap::new(),
             diagram_open_status: BTreeMap::new(),
             usage_by_request: BTreeMap::new(),
+            model_calls: Vec::new(),
+            budgets: BTreeMap::new(),
             repository_scroll: 0,
             conversation_scroll: 0,
             conversation_follow_tail: true,
@@ -639,6 +710,21 @@ impl TuiApp {
     #[must_use]
     pub const fn preferences(&self) -> &UiPreferences {
         &self.preferences
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> ExplanationProfile {
+        self.profile
+    }
+
+    #[must_use]
+    pub const fn profile_settings(&self) -> Option<&ProfileSettings> {
+        self.profile_settings.as_ref()
+    }
+
+    #[must_use]
+    pub const fn suggested_action_menu(&self) -> Option<&SuggestedActionMenu> {
+        self.suggested_action_menu.as_ref()
     }
 
     pub const fn preferences_mut(&mut self) -> &mut UiPreferences {
@@ -761,6 +847,19 @@ impl TuiApp {
     #[must_use]
     pub fn active_request_id(&self) -> Option<RequestId> {
         self.active_request.as_ref().map(|active| active.request_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expect_answer_for_test(&mut self, request_id: RequestId) {
+        self.active_request = Some(ActiveRequest {
+            request_id,
+            kind: RequestKind::Ask,
+            cancelling: false,
+            cancel_request_id: None,
+        });
+        self.profiles_by_request
+            .entry(request_id)
+            .or_insert(self.profile);
     }
 
     #[must_use]
@@ -921,6 +1020,12 @@ impl TuiApp {
         if self.history.visible {
             return self.handle_history_key(key);
         }
+        if self.profile_settings.is_some() {
+            return self.handle_profile_settings_key(key);
+        }
+        if self.suggested_action_menu.is_some() {
+            return self.handle_suggested_action_key(key);
+        }
 
         if self.input_mode == InputMode::Navigation {
             self.handle_navigation_key(key)
@@ -1009,6 +1114,7 @@ impl TuiApp {
         self.activity = Activity::AskQueued;
         self.last_progress = None;
         self.selected_task = Some(request_id);
+        self.profiles_by_request.insert(request_id, self.profile);
         self.selected_tool = None;
         self.repository_scroll = 0;
         self.input_mode = InputMode::Navigation;
@@ -1021,6 +1127,7 @@ impl TuiApp {
             session_id: self.session_id,
             repository_id,
             question,
+            profile: self.profile,
         })
     }
 
@@ -1104,7 +1211,7 @@ impl TuiApp {
                 output.result.to_string(),
                 output.is_error,
             ),
-            AppEvent::EvidenceAdded { .. } => {}
+            AppEvent::EvidenceAdded { .. } | AppEvent::TaskTraceRecorded { .. } => {}
             AppEvent::AnswerDelta { request_id, delta } => {
                 self.reduce_answer_delta(request_id, &delta);
             }
@@ -1113,6 +1220,15 @@ impl TuiApp {
             }
             AppEvent::UsageUpdated { request_id, usage } => {
                 self.reduce_usage(request_id, usage);
+            }
+            AppEvent::ModelCallRecorded { request_id, record } => {
+                self.model_calls.push((request_id, record));
+            }
+            AppEvent::BudgetUpdated { request_id, status }
+            | AppEvent::BudgetExceeded {
+                request_id, status, ..
+            } => {
+                self.budgets.insert(request_id, status);
             }
             AppEvent::IndexCompleted {
                 request_id,
@@ -1167,6 +1283,8 @@ impl TuiApp {
                 self.error_scroll = 0;
             }
             KeyCode::Char('i') => self.begin_repository_input(),
+            KeyCode::Char('g') => self.open_profile_settings(),
+            KeyCode::Char('A') => self.open_suggested_actions(),
             KeyCode::Char('h') => return Some(self.open_history()),
             KeyCode::Char('N') => self.start_new_session(),
             KeyCode::Char('o') => return self.open_selected_diagram(),
@@ -1204,6 +1322,199 @@ impl TuiApp {
             _ => {}
         }
         None
+    }
+
+    fn open_profile_settings(&mut self) {
+        if self.active_request.is_some() {
+            let activity = self.activity;
+            self.set_local_error(
+                "busy",
+                "Cancel the active request before changing the explanation profile",
+            );
+            self.activity = activity;
+            return;
+        }
+        self.profile_settings = Some(ProfileSettings {
+            draft: self.profile,
+            field: ProfileField::Audience,
+        });
+    }
+
+    fn handle_profile_settings_key(&mut self, key: KeyEvent) -> Option<AppCommand> {
+        match key.code {
+            KeyCode::Esc => self.profile_settings = None,
+            KeyCode::Enter => {
+                if let Some(settings) = self.profile_settings.take() {
+                    self.profile = settings.draft;
+                }
+            }
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Char('j' | 'k')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
+                if let Some(settings) = self.profile_settings.as_mut() {
+                    settings.field = match settings.field {
+                        ProfileField::Audience => ProfileField::Depth,
+                        ProfileField::Depth => ProfileField::Audience,
+                    };
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.change_profile_value(false),
+            KeyCode::Right | KeyCode::Char('l') => self.change_profile_value(true),
+            _ => {}
+        }
+        None
+    }
+
+    fn change_profile_value(&mut self, next: bool) {
+        let Some(settings) = self.profile_settings.as_mut() else {
+            return;
+        };
+        match settings.field {
+            ProfileField::Audience => {
+                settings.draft.audience = adjacent_audience(settings.draft.audience, next);
+            }
+            ProfileField::Depth => {
+                settings.draft.depth = adjacent_depth(settings.draft.depth, next);
+            }
+        }
+    }
+
+    fn open_suggested_actions(&mut self) {
+        if self.active_request.is_some() {
+            self.set_local_error(
+                "busy",
+                "Cancel the active request before running a suggested action",
+            );
+            return;
+        }
+        let selected_task = self.selected_task;
+        let selected = self.conversation.iter().find_map(|entry| match entry {
+            ConversationEntry::Answer(answer)
+                if answer.complete
+                    && selected_task.is_some_and(|request_id| request_id == answer.request_id)
+                    && answer.answer_id.is_some()
+                    && !answer.suggested_actions.is_empty() =>
+            {
+                Some((
+                    answer.request_id,
+                    answer.answer_id.expect("checked above"),
+                    answer
+                        .suggested_actions
+                        .iter()
+                        .copied()
+                        .take(4)
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            ConversationEntry::Question { .. } | ConversationEntry::Answer(_) => None,
+        });
+        let Some((answer_request_id, answer_id, actions)) = selected else {
+            self.set_local_error(
+                "suggested_actions_unavailable",
+                "The selected answer has no suggested actions",
+            );
+            return;
+        };
+        self.suggested_action_menu = Some(SuggestedActionMenu {
+            answer_request_id,
+            answer_id,
+            actions,
+            selected: 0,
+        });
+        self.clear_error();
+    }
+
+    fn handle_suggested_action_key(&mut self, key: KeyEvent) -> Option<AppCommand> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('A') => self.suggested_action_menu = None,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                if let Some(menu) = self.suggested_action_menu.as_mut() {
+                    menu.selected = menu.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                if let Some(menu) = self.suggested_action_menu.as_mut() {
+                    menu.selected = menu
+                        .selected
+                        .saturating_add(1)
+                        .min(menu.actions.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => return self.run_selected_suggested_action(),
+            _ => {}
+        }
+        None
+    }
+
+    fn run_selected_suggested_action(&mut self) -> Option<AppCommand> {
+        let menu = self.suggested_action_menu.take()?;
+        let action = *menu.actions.get(menu.selected)?;
+        let Some(repository_id) = self
+            .repository
+            .repository_id
+            .filter(|repository_id| self.session_repository_id == Some(*repository_id))
+        else {
+            self.set_local_error(
+                "session_repository_mismatch",
+                "Index the repository for this session before running a suggested action",
+            );
+            return None;
+        };
+        let request_id = self.next_request_id("suggested-action");
+
+        if let SuggestedAction::ShowSource { evidence_id } = action {
+            let Some(index) = self
+                .evidence
+                .iter()
+                .position(|evidence| evidence.id == evidence_id)
+            else {
+                self.set_local_error(
+                    "suggested_source_unavailable",
+                    "The suggested source is not available in this answer",
+                );
+                return None;
+            };
+            self.selected_evidence = Some(index);
+            self.prepare_evidence_viewer(index, Some((request_id, repository_id)))?;
+        } else {
+            let mut profile = self
+                .profiles_by_request
+                .get(&menu.answer_request_id)
+                .copied()
+                .unwrap_or(self.profile);
+            if let SuggestedAction::ChangeDepth { depth } = action {
+                profile.depth = depth;
+            }
+            self.profile = profile;
+            self.profiles_by_request.insert(request_id, profile);
+            self.conversation.push(ConversationEntry::Question {
+                request_id,
+                text: format!("Suggested action: {}", action.label()),
+            });
+            self.active_request = Some(ActiveRequest {
+                request_id,
+                kind: RequestKind::Ask,
+                cancelling: false,
+                cancel_request_id: None,
+            });
+            self.activity = Activity::AskQueued;
+            self.last_progress = None;
+            self.selected_task = Some(request_id);
+            self.selected_tool = None;
+            self.focused_panel = Panel::Conversation;
+            self.conversation_follow_tail = true;
+            self.clear_error();
+        }
+
+        Some(AppCommand::RunSuggestedAction {
+            request_id,
+            session_id: self.session_id,
+            repository_id,
+            answer_id: menu.answer_id,
+            action,
+        })
     }
 
     fn handle_history_key(&mut self, key: KeyEvent) -> Option<AppCommand> {
@@ -1351,51 +1662,60 @@ impl TuiApp {
 
     fn open_selected_evidence(&mut self) -> Option<AppCommand> {
         let index = self.selected_evidence?;
+        let pending = self
+            .repository
+            .repository_id
+            .filter(|repository_id| self.session_repository_id == Some(*repository_id))
+            .map(|repository_id| (self.next_request_id("source"), repository_id));
+        let evidence = self.prepare_evidence_viewer(index, pending)?;
+        pending.map(|(request_id, repository_id)| AppCommand::LoadSource {
+            request_id,
+            repository_id,
+            path: evidence.path,
+            start_line: evidence.start_line,
+            end_line: Some(evidence.end_line),
+        })
+    }
+
+    fn prepare_evidence_viewer(
+        &mut self,
+        index: usize,
+        pending: Option<(RequestId, RepositoryId)>,
+    ) -> Option<PendingSourceLoad> {
         let evidence = self.evidence.get(index)?.clone();
         let (start_line, end_line) = evidence_line_range(&evidence);
         let content = evidence.excerpt.unwrap_or_default();
         let content_end_line = content_end_line(start_line, &content);
-        let mut viewer = EvidenceViewer {
+        let pending = pending.map(|(request_id, repository_id)| PendingSourceLoad {
+            request_id,
+            repository_id,
+            path: evidence.path.clone(),
+            start_line,
+            end_line,
+        });
+        if let Some(pending) = &pending {
+            self.pending_source_requests.insert(pending.request_id);
+        }
+        self.evidence_viewer = Some(EvidenceViewer {
             evidence_id: evidence.id,
             evidence_index: index,
-            path: evidence.path.clone(),
+            path: evidence.path,
             start_line,
             end_line,
             symbol_id: evidence.symbol_id,
             content,
             content_start_line: start_line,
             content_end_line,
-            source_state: SourceLoadState::Excerpt,
+            source_state: pending
+                .clone()
+                .map_or(SourceLoadState::Excerpt, SourceLoadState::Loading),
             wrap: self.preferences.wrap_evidence,
             vertical_scroll: 0,
             horizontal_scroll: 0,
-        };
+        });
         self.clipboard_request = None;
         self.clipboard_status = None;
-
-        let command = self
-            .repository
-            .repository_id
-            .filter(|repository_id| self.session_repository_id == Some(*repository_id))
-            .map(|repository_id| {
-                let request_id = self.next_request_id("source");
-                viewer.source_state = SourceLoadState::Loading(PendingSourceLoad {
-                    request_id,
-                    repository_id,
-                    path: evidence.path.clone(),
-                    start_line,
-                });
-                self.pending_source_requests.insert(request_id);
-                AppCommand::LoadSource {
-                    request_id,
-                    repository_id,
-                    path: evidence.path,
-                    start_line,
-                    end_line: Some(end_line),
-                }
-            });
-        self.evidence_viewer = Some(viewer);
-        command
+        pending
     }
 
     fn switch_evidence(&mut self, next: bool) -> Option<AppCommand> {
@@ -1697,6 +2017,9 @@ impl TuiApp {
 
     fn select_task(&mut self, request_id: RequestId) {
         self.selected_task = Some(request_id);
+        if let Some(profile) = self.profiles_by_request.get(&request_id) {
+            self.profile = *profile;
+        }
         self.selected_tool = self
             .tools
             .iter()
@@ -1899,7 +2222,10 @@ impl TuiApp {
     }
 
     fn reduce_answer_delta(&mut self, request_id: RequestId, delta: &str) {
-        if self.request_outcomes.contains_key(&request_id) {
+        if !self.active_request.as_ref().is_some_and(|active| {
+            active.request_id == request_id && active.kind == RequestKind::Ask
+        }) || self.request_outcomes.contains_key(&request_id)
+        {
             return;
         }
         let answer = self.answer_mut_or_insert(request_id);
@@ -1910,20 +2236,35 @@ impl TuiApp {
     }
 
     fn reduce_answer_completed(&mut self, request_id: RequestId, answer: AgentAnswer) {
-        if self.request_outcomes.contains_key(&request_id) {
+        if !self.active_request.as_ref().is_some_and(|active| {
+            active.request_id == request_id && active.kind == RequestKind::Ask
+        }) || self.request_outcomes.contains_key(&request_id)
+        {
             return;
         }
-        for evidence in answer.evidence {
+        let AgentAnswer {
+            id,
+            text,
+            claims,
+            evidence,
+            call_paths,
+            diagram,
+            suggested_actions,
+            usage,
+        } = answer;
+        for evidence in evidence {
             self.upsert_evidence(evidence);
         }
-        if let Some(usage) = answer.usage {
+        if let Some(usage) = usage {
             self.reduce_usage(request_id, usage);
         }
         let view = self.answer_mut_or_insert(request_id);
-        view.text = answer.text;
-        view.claims = answer.claims;
-        view.call_paths = answer.call_paths;
-        view.diagram = Some(answer.diagram);
+        view.answer_id = Some(id);
+        view.text = text;
+        view.claims = claims;
+        view.call_paths = call_paths;
+        view.diagram = Some(diagram);
+        view.suggested_actions = suggested_actions.into_iter().take(4).collect();
         view.complete = true;
         let was_active = self.finish_request(request_id, RequestOutcome::Completed);
         if was_active || self.active_request.is_none() {
@@ -1940,10 +2281,12 @@ impl TuiApp {
             self.conversation
                 .push(ConversationEntry::Answer(AnswerView {
                     request_id,
+                    answer_id: None,
                     text: String::new(),
                     claims: Vec::new(),
                     call_paths: Vec::new(),
                     diagram: None,
+                    suggested_actions: Vec::new(),
                     complete: false,
                 }));
             self.conversation.len() - 1
@@ -2025,41 +2368,105 @@ impl TuiApp {
         self.session_id = session.session_id;
         self.session_repository_id = Some(session.repository_id);
         self.session_json_path = Some(session.json_path);
+        let latest_status = session.tasks.last().map(|task| task.status);
+        let latest_profile = session.tasks.last().map(|task| task.profile);
 
         for task in session.tasks {
-            let request_id = task.request_id;
-            self.conversation.push(ConversationEntry::Question {
-                request_id,
-                text: task.question,
-            });
-            for event in task.workflow {
-                match event {
-                    WorkflowEvent::Progress(progress) => {
-                        self.reduce_progress(request_id, progress);
-                    }
-                    WorkflowEvent::ToolCallStarted(call) => self.reduce_tool_started(
-                        request_id,
-                        call.id,
-                        call.name,
-                        call.arguments.to_string(),
-                    ),
-                    WorkflowEvent::ToolCallCompleted {
-                        call_id,
-                        output,
-                        is_error,
-                    } => self.reduce_tool_completed(request_id, call_id, output, is_error),
-                }
-            }
+            self.restore_session_task(task);
+        }
 
+        let tasks = self.task_request_ids();
+        if let Some(request_id) = tasks.last().copied() {
+            self.select_task_with_evidence(request_id);
+        }
+        if let Some(profile) = latest_profile {
+            self.profile = profile;
+        }
+        self.activity = match latest_status {
+            None => Activity::Indexed,
+            Some(SessionTaskStatus::Completed) => Activity::AnswerReady,
+            Some(SessionTaskStatus::Cancelled) => Activity::Cancelled,
+            Some(SessionTaskStatus::Failed | SessionTaskStatus::BudgetExceeded) => Activity::Error,
+        };
+        self.history.loading = false;
+        self.history.visible = false;
+        self.conversation_follow_tail = true;
+        self.clear_error();
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "restoring one task keeps trajectory replay and terminal reconciliation together"
+    )]
+    fn restore_session_task(&mut self, task: SessionTask) {
+        let request_id = task.request_id;
+        self.profiles_by_request.insert(request_id, task.profile);
+        self.conversation.push(ConversationEntry::Question {
+            request_id,
+            text: task.question,
+        });
+        for event in task.trajectory {
+            match event {
+                WorkflowEvent::Progress(progress) => self.reduce_progress(request_id, progress),
+                WorkflowEvent::ToolCallStarted(call) => self.reduce_tool_started(
+                    request_id,
+                    call.id,
+                    call.name,
+                    call.arguments.to_string(),
+                ),
+                WorkflowEvent::ToolCallCompleted {
+                    call_id,
+                    output,
+                    is_error,
+                } => self.reduce_tool_completed(request_id, call_id, output, is_error),
+                WorkflowEvent::Usage(usage) => {
+                    self.usage_by_request.insert(request_id, usage);
+                }
+                WorkflowEvent::BudgetUpdated(status)
+                | WorkflowEvent::BudgetExceeded { status, .. } => {
+                    self.budgets.insert(request_id, status);
+                }
+                WorkflowEvent::ModelCall(_)
+                | WorkflowEvent::Message(_)
+                | WorkflowEvent::ModelRequest { .. }
+                | WorkflowEvent::ModelResponse { .. }
+                | WorkflowEvent::ModelError { .. } => {}
+            }
+        }
+        if let Some(usage) = task.usage {
+            self.usage_by_request.insert(request_id, usage);
+        }
+        self.model_calls.extend(
+            task.model_calls
+                .into_iter()
+                .map(|record| (request_id, record)),
+        );
+        if let Some(budget) = task.budget {
+            self.budgets.insert(request_id, budget);
+        }
+        let unfinished_status = match task.status {
+            SessionTaskStatus::Completed => ToolTraceStatus::Completed,
+            SessionTaskStatus::Cancelled => ToolTraceStatus::Cancelled,
+            SessionTaskStatus::Failed | SessionTaskStatus::BudgetExceeded => {
+                ToolTraceStatus::Failed
+            }
+        };
+        for tool in &mut self.tools {
+            if tool.request_id == request_id && tool.status == ToolTraceStatus::Running {
+                tool.status = unfinished_status;
+            }
+        }
+        if let Some(answer) = task.answer {
             let AgentAnswer {
-                id: _,
+                id,
                 text,
                 claims,
                 evidence,
                 call_paths,
                 diagram,
+                suggested_actions,
                 usage,
-            } = task.answer;
+            } = answer;
             for evidence in evidence {
                 self.upsert_evidence(evidence);
             }
@@ -2069,29 +2476,41 @@ impl TuiApp {
             self.conversation
                 .push(ConversationEntry::Answer(AnswerView {
                     request_id,
+                    answer_id: Some(id),
                     text,
                     claims,
                     call_paths,
                     diagram: Some(diagram),
+                    suggested_actions: suggested_actions.into_iter().take(4).collect(),
                     complete: true,
                 }));
-            self.request_outcomes
-                .insert(request_id, RequestOutcome::Completed);
-        }
-
-        let tasks = self.task_request_ids();
-        if let Some(request_id) = tasks.last().copied() {
-            self.select_task_with_evidence(request_id);
-        }
-        self.activity = if self.conversation.is_empty() {
-            Activity::Indexed
         } else {
-            Activity::AnswerReady
-        };
-        self.history.loading = false;
-        self.history.visible = false;
-        self.conversation_follow_tail = true;
-        self.clear_error();
+            let detail = task.terminal_error.map_or_else(
+                || task_status_label(task.status).to_owned(),
+                |error| error.message,
+            );
+            self.conversation
+                .push(ConversationEntry::Answer(AnswerView {
+                    request_id,
+                    answer_id: None,
+                    text: format!("{}: {detail}", task_status_label(task.status)),
+                    claims: Vec::new(),
+                    call_paths: Vec::new(),
+                    diagram: None,
+                    suggested_actions: Vec::new(),
+                    complete: true,
+                }));
+        }
+        self.request_outcomes.insert(
+            request_id,
+            match task.status {
+                SessionTaskStatus::Completed => RequestOutcome::Completed,
+                SessionTaskStatus::Cancelled => RequestOutcome::Cancelled,
+                SessionTaskStatus::Failed | SessionTaskStatus::BudgetExceeded => {
+                    RequestOutcome::Failed
+                }
+            },
+        );
     }
 
     fn clear_session_context(&mut self) {
@@ -2107,7 +2526,12 @@ impl TuiApp {
         self.progress_trace.clear();
         self.last_progress = None;
         self.selected_task = None;
+        self.profiles_by_request.clear();
+        self.profile_settings = None;
+        self.suggested_action_menu = None;
         self.usage_by_request.clear();
+        self.model_calls.clear();
+        self.budgets.clear();
         self.request_outcomes.clear();
         self.cancel_targets.clear();
         self.pending_diagram_opens.clear();
@@ -2381,6 +2805,24 @@ impl TuiApp {
         })
     }
 
+    pub(crate) fn selected_model_calls(&self) -> impl Iterator<Item = &ModelCallRecord> {
+        let selected_task = self.selected_task;
+        self.model_calls
+            .iter()
+            .filter_map(move |(request_id, record)| {
+                selected_task
+                    .is_none_or(|selected| selected == *request_id)
+                    .then_some(record)
+            })
+    }
+
+    pub(crate) fn selected_budget(&self) -> Option<&ModelBudgetStatus> {
+        match self.selected_task {
+            Some(request_id) => self.budgets.get(&request_id),
+            None => self.budgets.values().next_back(),
+        }
+    }
+
     pub(crate) fn selected_answers(&self) -> impl Iterator<Item = &AnswerView> {
         let selected_task = self.selected_task;
         self.conversation
@@ -2518,4 +2960,41 @@ pub(crate) fn evidence_line_range(evidence: &Evidence) -> (u32, u32) {
 fn content_end_line(start_line: u32, content: &str) -> u32 {
     let offset = u32::try_from(content.lines().count().saturating_sub(1)).unwrap_or(u32::MAX);
     start_line.saturating_add(offset)
+}
+
+const fn adjacent_audience(audience: ExplanationAudience, next: bool) -> ExplanationAudience {
+    match (audience, next) {
+        (ExplanationAudience::Beginner, true) | (ExplanationAudience::Expert, false) => {
+            ExplanationAudience::Developer
+        }
+        (ExplanationAudience::Developer, true) | (ExplanationAudience::Beginner, false) => {
+            ExplanationAudience::Expert
+        }
+        (ExplanationAudience::Expert, true) | (ExplanationAudience::Developer, false) => {
+            ExplanationAudience::Beginner
+        }
+    }
+}
+
+const fn adjacent_depth(depth: ExplanationDepth, next: bool) -> ExplanationDepth {
+    match (depth, next) {
+        (ExplanationDepth::Auto, true) | (ExplanationDepth::Architecture, false) => {
+            ExplanationDepth::Overview
+        }
+        (ExplanationDepth::Overview, true) | (ExplanationDepth::Workflow, false) => {
+            ExplanationDepth::Architecture
+        }
+        (ExplanationDepth::Architecture, true) | (ExplanationDepth::Code, false) => {
+            ExplanationDepth::Workflow
+        }
+        (ExplanationDepth::Workflow, true) | (ExplanationDepth::Detail, false) => {
+            ExplanationDepth::Code
+        }
+        (ExplanationDepth::Code, true) | (ExplanationDepth::Auto, false) => {
+            ExplanationDepth::Detail
+        }
+        (ExplanationDepth::Detail, true) | (ExplanationDepth::Overview, false) => {
+            ExplanationDepth::Auto
+        }
+    }
 }

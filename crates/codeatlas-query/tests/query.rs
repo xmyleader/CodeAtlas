@@ -430,6 +430,25 @@ fn typed_queries_cover_all_nine_repository_operations() {
 }
 
 #[test]
+fn source_search_observes_cooperative_cancellation() {
+    let fixture = Fixture::new();
+    let index = fixture.index();
+    let error = index
+        .search_code_cancellable(
+            &SearchCodeQuery {
+                query: "alpha".to_owned(),
+                path_prefix: None,
+                case_sensitive: Some(true),
+                limit: Some(10),
+            },
+            &|| true,
+        )
+        .expect_err("cancelled search should stop before reading source");
+
+    assert_eq!(error, QueryError::Cancelled);
+}
+
+#[test]
 fn repository_overview_is_compact_and_omits_tests_by_default() {
     let fixture = Fixture::new();
     let mut model = fixture.model.clone();

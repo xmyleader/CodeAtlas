@@ -11,16 +11,17 @@ use async_trait::async_trait;
 use codeatlas_agent::{
     AgentRequest, AgentRuntime, AssistantOutput, AssistantToolCall, CancellationToken,
     ChannelEventSink, ConversationMessage, ConversationRole, MockModelClient, ModelClient,
-    ModelError, ModelMessage, ModelRequest, ModelResponse, RepositoryToolEnvelope, RuntimeConfig,
-    RuntimeError, SUBMIT_ANSWER_TOOL_NAME, SYSTEM_PROMPT, StructuredAnswer, StructuredCallPath,
-    StructuredClaim, StructuredDiagram, StructuredDiagramDecision, StructuredDiagramEdge,
-    StructuredDiagramNode,
+    ModelError, ModelMessage, ModelPricing, ModelRequest, ModelResponse, RepositoryToolEnvelope,
+    RuntimeConfig, RuntimeError, SUBMIT_ANSWER_TOOL_NAME, SYSTEM_PROMPT, StructuredAnswer,
+    StructuredCallPath, StructuredClaim, StructuredDiagram, StructuredDiagramDecision,
+    StructuredDiagramEdge, StructuredDiagramNode,
 };
 use codeatlas_core::{
     AppEvent, CallPathStep, ClaimKind, DiagramDecision, DiagramKind, Evidence, EvidenceId,
-    EvidenceValidationError, FileId, ProgressPhase, RepositoryId, RepositoryPath, RequestId,
-    SessionId, SourceSpan, SymbolId, TargetResolution, TokenUsage, ToolCall, ToolDefinition,
-    ToolError, ToolExecutor, ToolOutput,
+    EvidenceValidationError, ExplanationAudience, ExplanationDepth, ExplanationProfile, FileId,
+    ModelBudget, ModelCallOutcome, MonetaryBudget, ProgressPhase, RepositoryId, RepositoryPath,
+    RequestId, SessionId, SourceSpan, SuggestedAction, SymbolId, TargetResolution, TokenUsage,
+    ToolCall, ToolDefinition, ToolError, ToolExecutor, ToolOutput, WorkflowEvent,
 };
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -334,8 +335,151 @@ fn assert_tool_protocol(request: &ModelRequest, expected_provider_ids: &[&str]) 
     assert_eq!(tool_ids, expected_provider_ids);
 }
 
+#[test]
+fn agent_request_serde_defaults_the_profile_and_constructor_helpers_preserve_it() {
+    let original = request("request-serde");
+    let mut legacy = serde_json::to_value(&original).expect("request should serialize");
+    legacy
+        .as_object_mut()
+        .expect("request should be an object")
+        .remove("profile");
+    let restored: AgentRequest =
+        serde_json::from_value(legacy).expect("legacy request should deserialize");
+    assert_eq!(restored.profile, ExplanationProfile::default());
+
+    let profile = ExplanationProfile::new(ExplanationAudience::Expert, ExplanationDepth::Detail);
+    assert_eq!(
+        original
+            .with_history(vec![ConversationMessage {
+                role: ConversationRole::User,
+                content: "prior".to_owned(),
+            }])
+            .with_profile(profile)
+            .profile,
+        profile
+    );
+}
+
 #[tokio::test]
-async fn cumulative_token_usage_is_reported_without_a_hard_stop() {
+async fn profile_reaches_the_exact_model_request_and_observable_transcript() {
+    let model = Arc::new(MockModelClient::new([Ok(final_response(Vec::new(), 1))]));
+    let runtime = AgentRuntime::new(
+        model.clone(),
+        Arc::new(ScriptedExecutor::default()),
+        Vec::new(),
+        RuntimeConfig::default(),
+    )
+    .expect("valid runtime");
+    let profile =
+        ExplanationProfile::new(ExplanationAudience::Beginner, ExplanationDepth::Workflow);
+    let request = request("profile-request").with_profile(profile);
+    let request_id = request.request_id;
+    let (sink, mut events) = ChannelEventSink::channel();
+
+    runtime
+        .run(request, CancellationToken::new(), &sink)
+        .await
+        .expect("profile request should complete");
+
+    let model_request = &model.requests()[0];
+    assert_eq!(
+        model_request.messages[0],
+        ModelMessage::system(SYSTEM_PROMPT)
+    );
+    assert_eq!(
+        model_request.messages[1],
+        ModelMessage::system(profile.control_message())
+    );
+    assert_eq!(
+        model_request.messages[2],
+        ModelMessage::user("How does this repository work?")
+    );
+    let expected_control = serde_json::to_value(ModelMessage::system(profile.control_message()))
+        .expect("control message should serialize");
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+            event,
+            AppEvent::TaskTraceRecorded {
+                request_id: event_request_id,
+                event: WorkflowEvent::Message(value),
+            } if event_request_id == request_id && value == expected_control
+        ))
+    );
+}
+
+#[tokio::test]
+async fn suggested_actions_are_deterministic_bounded_and_reference_final_answer() {
+    let item = evidence("suggested-actions");
+    let path = StructuredCallPath {
+        label: Some("runtime dispatch".to_owned()),
+        steps: vec![CallPathStep {
+            target: TargetResolution::Resolved(SymbolId::from_stable_parts(&[
+                "suggested-actions-target",
+            ])),
+            call_edge_id: None,
+            evidence_ids: vec![item.id],
+        }],
+        complete: false,
+    };
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        let model = Arc::new(MockModelClient::new([
+            Ok(tool_response("suggested-tool", "inspect", 1)),
+            Ok(submitted_answer_with_call_paths(
+                "suggested-final",
+                vec![StructuredClaim {
+                    kind: ClaimKind::Fact,
+                    text: "The runtime dispatches the request.".to_owned(),
+                    evidence_ids: vec![item.id],
+                }],
+                vec![path.clone()],
+                1,
+            )),
+        ]));
+        let runtime = AgentRuntime::new(
+            model,
+            Arc::new(ScriptedExecutor::new([ToolStep::Success {
+                data: json!({"symbol": "dispatch"}),
+                evidence: vec![item.clone()],
+            }])),
+            vec![tool("inspect")],
+            RuntimeConfig::default(),
+        )
+        .expect("valid runtime");
+        answers.push(
+            runtime
+                .run_silent(request("suggested-actions"), CancellationToken::new())
+                .await
+                .expect("grounded answer should complete"),
+        );
+    }
+
+    assert_eq!(answers[0].suggested_actions, answers[1].suggested_actions);
+    assert_eq!(answers[0].suggested_actions.len(), 4);
+    assert_eq!(
+        answers[0].suggested_actions,
+        vec![
+            SuggestedAction::DeepenClaim {
+                claim_id: answers[0].claims[0].id,
+            },
+            SuggestedAction::ContinueCallPath {
+                call_path_id: answers[0].call_paths[0].id,
+            },
+            SuggestedAction::ShowSource {
+                evidence_id: answers[0].evidence[0].id,
+            },
+            SuggestedAction::ChangeDepth {
+                depth: ExplanationDepth::Architecture,
+            },
+        ]
+    );
+    answers[0]
+        .validate_evidence()
+        .expect("every generated reference must exist in the pruned answer");
+}
+
+#[tokio::test]
+async fn default_configuration_reports_usage_without_enabling_a_budget() {
     let model = Arc::new(MockModelClient::new([Ok(final_response(
         vec![StructuredClaim {
             kind: ClaimKind::Inference,
@@ -344,11 +488,13 @@ async fn cumulative_token_usage_is_reported_without_a_hard_stop() {
         }],
         1_000_000,
     ))]));
+    let config = RuntimeConfig::default();
+    assert!(!config.budget.is_enabled());
     let runtime = AgentRuntime::new(
         model,
         Arc::new(ScriptedExecutor::default()),
         Vec::new(),
-        RuntimeConfig::default(),
+        config,
     )
     .expect("valid runtime");
 
@@ -430,6 +576,222 @@ async fn explicitly_reported_zero_usage_remains_present() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn model_call_ledger_records_retries_with_stable_sequence_and_outcome() {
+    let model = Arc::new(MockModelClient::new([
+        Err(ModelError::Transport {
+            message: "temporary disconnect".to_owned(),
+        }),
+        Ok(final_response(Vec::new(), 7)),
+    ]));
+    let runtime = AgentRuntime::new(
+        model,
+        Arc::new(ScriptedExecutor::default()),
+        Vec::new(),
+        RuntimeConfig {
+            max_model_retries: 1,
+            model_retry_initial_delay: Duration::ZERO,
+            ..RuntimeConfig::default()
+        },
+    )
+    .expect("valid runtime");
+    let request = request("model-ledger");
+    let request_id = request.request_id;
+    let (sink, mut receiver) = ChannelEventSink::channel();
+
+    runtime
+        .run(request, CancellationToken::new(), &sink)
+        .await
+        .expect("retry should recover");
+    let mut records = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if let AppEvent::ModelCallRecorded { record, .. } = event {
+            records.push(record);
+        }
+    }
+
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].sequence, 1);
+    assert_eq!(records[1].sequence, 2);
+    assert_ne!(records[0].id, records[1].id);
+    assert_eq!(
+        records[0].id,
+        codeatlas_core::ModelCallId::from_stable_parts(&[&request_id.to_string(), "1"])
+    );
+    assert!(matches!(
+        records[0].outcome,
+        ModelCallOutcome::Failed {
+            retryable: true,
+            ..
+        }
+    ));
+    assert!(matches!(records[1].outcome, ModelCallOutcome::Succeeded));
+    assert_eq!(records[1].usage.map(|usage| usage.total_tokens), Some(7));
+}
+
+#[tokio::test]
+async fn retryable_model_timeout_is_ledgered_as_timed_out_before_retrying() {
+    let model = Arc::new(MockModelClient::new([
+        Err(ModelError::Timeout { timeout_ms: 25 }),
+        Ok(final_response(Vec::new(), 7)),
+    ]));
+    let runtime = AgentRuntime::new(
+        model,
+        Arc::new(ScriptedExecutor::default()),
+        Vec::new(),
+        RuntimeConfig {
+            max_model_retries: 1,
+            model_retry_initial_delay: Duration::ZERO,
+            ..RuntimeConfig::default()
+        },
+    )
+    .expect("valid runtime");
+    let (sink, mut receiver) = ChannelEventSink::channel();
+
+    runtime
+        .run(request("timeout-ledger"), CancellationToken::new(), &sink)
+        .await
+        .expect("retry should recover");
+    let records = std::iter::from_fn(|| receiver.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::ModelCallRecorded { record, .. } => Some(record),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(records.len(), 2);
+    assert!(matches!(records[0].outcome, ModelCallOutcome::TimedOut));
+    assert!(matches!(records[1].outcome, ModelCallOutcome::Succeeded));
+}
+
+#[tokio::test]
+async fn token_budget_stops_before_any_follow_up_model_request() {
+    let model = Arc::new(MockModelClient::new([
+        Ok(tool_response("budget-tool", "read_source", 10)),
+        Ok(final_response(Vec::new(), 1)),
+    ]));
+    let executor = Arc::new(ScriptedExecutor::new([ToolStep::Success {
+        data: json!({}),
+        evidence: Vec::new(),
+    }]));
+    let runtime = AgentRuntime::new(
+        model.clone(),
+        executor.clone(),
+        vec![tool("read_source")],
+        RuntimeConfig {
+            budget: ModelBudget {
+                max_total_tokens: Some(10),
+                max_cost: None,
+            },
+            ..RuntimeConfig::default()
+        },
+    )
+    .expect("valid runtime");
+    let request = request("token-budget");
+    let (sink, mut receiver) = ChannelEventSink::channel();
+
+    let error = runtime
+        .run(request, CancellationToken::new(), &sink)
+        .await
+        .expect_err("budget must terminate the task");
+    let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+
+    assert!(matches!(
+        error,
+        RuntimeError::TokenBudgetExceeded {
+            used: 10,
+            limit: 10
+        }
+    ));
+    assert_eq!(model.requests().len(), 1);
+    assert!(executor.calls().is_empty());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::BudgetExceeded {
+            reason: codeatlas_core::BudgetStopReason::TotalTokensReached {
+                used: 10,
+                limit: 10
+            },
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn enabled_budget_fails_closed_when_provider_omits_usage() {
+    let mut response = final_response(Vec::new(), 1);
+    response.usage = None;
+    let model = Arc::new(MockModelClient::new([Ok(response)]));
+    let runtime = AgentRuntime::new(
+        model.clone(),
+        Arc::new(ScriptedExecutor::default()),
+        Vec::new(),
+        RuntimeConfig {
+            budget: ModelBudget {
+                max_total_tokens: Some(100),
+                max_cost: None,
+            },
+            ..RuntimeConfig::default()
+        },
+    )
+    .expect("valid runtime");
+
+    let error = runtime
+        .run_silent(request("missing-budget-usage"), CancellationToken::new())
+        .await
+        .expect_err("missing usage makes the budget unenforceable");
+
+    assert!(matches!(error, RuntimeError::BudgetUnenforceable));
+    assert_eq!(error.to_app_error().code, "budget_unenforceable");
+    assert_eq!(model.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn monetary_budget_uses_explicit_per_call_pricing() {
+    let model = Arc::new(MockModelClient::new([Ok(final_response(
+        Vec::new(),
+        1_000_000,
+    ))]));
+    let runtime = AgentRuntime::new(
+        model.clone(),
+        Arc::new(ScriptedExecutor::default()),
+        Vec::new(),
+        RuntimeConfig {
+            pricing: Some(ModelPricing {
+                currency: "USD".to_owned(),
+                input_per_million: 1.0,
+                cached_input_per_million: Some(0.2),
+                output_per_million: 4.0,
+            }),
+            budget: ModelBudget {
+                max_total_tokens: None,
+                max_cost: Some(MonetaryBudget {
+                    currency: "USD".to_owned(),
+                    amount: 0.5,
+                }),
+            },
+            ..RuntimeConfig::default()
+        },
+    )
+    .expect("valid runtime");
+    let (sink, mut receiver) = ChannelEventSink::channel();
+
+    let error = runtime
+        .run(request("cost-budget"), CancellationToken::new(), &sink)
+        .await
+        .expect_err("estimated cost reaches the configured limit");
+    let records = std::iter::from_fn(|| receiver.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::ModelCallRecorded { record, .. } => Some(record),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(matches!(error, RuntimeError::CostBudgetExceeded { .. }));
+    assert_eq!(model.requests().len(), 1);
+    assert_eq!(records[0].cost.as_ref().map(|cost| cost.amount), Some(1.0));
 }
 
 #[test]
@@ -872,7 +1234,7 @@ async fn known_context_window_drops_oldest_history_before_sending() {
 
     let requests = model.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].messages.len(), 2);
+    assert_eq!(requests[0].messages.len(), 3);
     let system = requests[0].messages[0]
         .content
         .as_deref()
@@ -880,7 +1242,85 @@ async fn known_context_window_drops_oldest_history_before_sending() {
     assert!(system.starts_with(SYSTEM_PROMPT));
     assert!(system.contains("oldest conversation turns were omitted"));
     assert_eq!(
-        requests[0].messages[1].content.as_deref(),
+        requests[0].messages[2].content.as_deref(),
+        Some("How does this repository work?")
+    );
+}
+
+#[tokio::test]
+async fn known_context_window_removes_complete_old_tool_turns_without_orphans() {
+    let model = Arc::new(WindowedModel::new(
+        16_384,
+        [Ok(final_response(Vec::new(), 1))],
+    ));
+    let runtime = AgentRuntime::new(
+        model.clone(),
+        Arc::new(ScriptedExecutor::default()),
+        Vec::new(),
+        RuntimeConfig::default(),
+    )
+    .expect("valid runtime");
+    let large_result = |label: &str| {
+        json!({
+            "data": {"content": format!("{label}:{}", "x".repeat(20_000))},
+            "evidence": []
+        })
+        .to_string()
+    };
+    let history = vec![
+        ModelMessage::user("old tool question"),
+        ModelMessage::assistant_tool_calls(
+            None,
+            vec![AssistantToolCall {
+                id: "old-history-tool".to_owned(),
+                name: "read_source".to_owned(),
+                arguments: json!({"path": "old.rs"}),
+            }],
+        ),
+        ModelMessage::tool(
+            "old-history-tool",
+            "read_source",
+            large_result("old-result"),
+        ),
+        ModelMessage::assistant("old tool answer"),
+        ModelMessage::user("newer tool question"),
+        ModelMessage::assistant_tool_calls(
+            None,
+            vec![AssistantToolCall {
+                id: "new-history-tool".to_owned(),
+                name: "read_source".to_owned(),
+                arguments: json!({"path": "new.rs"}),
+            }],
+        ),
+        ModelMessage::tool(
+            "new-history-tool",
+            "read_source",
+            large_result("new-result"),
+        ),
+        ModelMessage::assistant("newer tool answer"),
+    ];
+
+    runtime
+        .run_silent(
+            request("bounded-tool-history").with_transcript(history),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("complete historical tool groups should compact safely");
+
+    let sent = &model.requests()[0];
+    assert!(sent.messages.iter().all(|message| {
+        message.tool_call_id.as_deref() != Some("old-history-tool")
+            && message
+                .tool_calls
+                .iter()
+                .all(|call| call.id != "old-history-tool")
+    }));
+    assert_tool_protocol(sent, &["new-history-tool"]);
+    assert_eq!(
+        sent.messages
+            .last()
+            .and_then(|message| message.content.as_deref()),
         Some("How does this repository work?")
     );
 }
@@ -2394,6 +2834,53 @@ async fn cancellation_interrupts_an_in_flight_model_without_sleeping() {
     let result = task.await.expect("runtime task should join");
 
     assert!(matches!(result, Err(RuntimeError::Cancelled)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn long_model_wait_emits_elapsed_time_heartbeat() {
+    let (entered_sender, entered_receiver) = oneshot::channel();
+    let runtime = Arc::new(
+        AgentRuntime::new(
+            Arc::new(PendingModel {
+                entered: Mutex::new(Some(entered_sender)),
+            }),
+            Arc::new(ScriptedExecutor::default()),
+            Vec::new(),
+            RuntimeConfig {
+                timeout: Duration::from_secs(30),
+                ..RuntimeConfig::default()
+            },
+        )
+        .expect("valid runtime"),
+    );
+    let cancellation = CancellationToken::new();
+    let task_token = cancellation.clone();
+    let (sink, mut receiver) = ChannelEventSink::channel();
+    let task =
+        tokio::spawn(async move { runtime.run(request("heartbeat"), task_token, &sink).await });
+
+    entered_receiver
+        .await
+        .expect("model should signal that it is pending");
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        events.push(event);
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::Progress { progress, .. }
+            if progress.message.contains("waiting for model response")
+                && progress.message.contains("s elapsed")
+    )));
+
+    cancellation.cancel();
+    assert!(matches!(
+        task.await.expect("runtime task should join"),
+        Err(RuntimeError::Cancelled)
+    ));
 }
 
 #[tokio::test(start_paused = true)]

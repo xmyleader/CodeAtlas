@@ -402,6 +402,7 @@ fn architecture_showcase() -> Showcase {
                         .to_owned(),
                 diagram,
             },
+            suggested_actions: Vec::new(),
             usage: Some(offline_usage()),
         },
     }
@@ -639,6 +640,7 @@ fn ask_flow_showcase() -> Showcase {
                     .to_owned(),
                 diagram,
             },
+            suggested_actions: Vec::new(),
             usage: Some(offline_usage()),
         },
     }
@@ -865,6 +867,7 @@ fn evidence_relationship_showcase() -> Showcase {
                         .to_owned(),
                 diagram,
             },
+            suggested_actions: Vec::new(),
             usage: Some(offline_usage()),
         },
     }
