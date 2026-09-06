@@ -47,7 +47,7 @@ Question -> Agent runtime -> 9 bounded read-only tools
          Ratatui TUI    egui GUI
 ```
 
-工作区按职责拆分为 Core Contracts、Rust/Python Parser、Indexer、Query Tools、Agent Runtime、Diagram Renderer、Application、TUI 和 GUI。详细架构与三张离线生成的示例图见 [`diagram-showcase`](diagram-showcase/README.md)。
+工作区按职责拆分为 Core Contracts、Rust/Python Parser、Indexer、Query Tools、Agent Runtime、Diagram Renderer、Application、TUI 和 GUI。详细架构与三张离线生成的示例图见 [`diagram-showcase`](https://github.com/xmyleader/CodeAtlas/tree/main/diagram-showcase)。
 
 ## 作业固定要求
 
