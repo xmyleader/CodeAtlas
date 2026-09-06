@@ -102,6 +102,16 @@ sudo apt-get install -y build-essential pkg-config libx11-dev libxi-dev \
   libgl1-mesa-dev libwayland-dev libxkbcommon-dev xdg-desktop-portal
 ```
 
+## One-Line Install
+
+Install both the `codeatlas` TUI and `codeatlas-gui` native application directly from GitHub:
+
+```bash
+cargo install --git https://github.com/xmyleader/CodeAtlas.git --locked codeatlas-app
+```
+
+Cargo places both executables in `~/.cargo/bin` by default. Ensure that directory is in `PATH`, then run `codeatlas .` or `codeatlas-gui .` from the repository you want to understand.
+
 ## Build And Configure
 
 ```bash

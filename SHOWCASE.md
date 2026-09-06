@@ -63,15 +63,17 @@ Question -> Agent runtime -> 9 bounded read-only tools
 需要 Rust 1.85+ 和支持 OpenAI Chat Completions Tool Calling 的模型。完整配置见项目 `README.md` 和 `.env.example`。
 
 ```bash
+cargo install --git https://github.com/xmyleader/CodeAtlas.git --locked codeatlas-app
+
 export CODEATLAS_ENDPOINT="https://your-provider/v1/chat/completions"
 export CODEATLAS_MODEL="your-tool-capable-model"
 export CODEATLAS_API_KEY="your-api-key"
 
 # TUI
-cargo run -p codeatlas-app --bin codeatlas -- .
+codeatlas .
 
 # GUI
-cargo run -p codeatlas-app --bin codeatlas-gui -- .
+codeatlas-gui .
 ```
 
 TUI 中按 `a` 提问、`g` 设置解释层次、`A` 运行建议动作、`h` 查看历史、`c` 取消。GUI 在提问框旁提供 Audience/Depth 选择器，并在回答下显示建议动作按钮。
